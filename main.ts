@@ -3,11 +3,15 @@
 // out/data.js, mirrors the dashboard into out/, and bundles the dossier
 // (dashboard source + screenshots) into out/dossier.json.
 //
-//   node main.ts [snapshot.json]
+//   node main.ts [--input snapshot.json] [--output out]
 //
-// With no argument it reads the kit snapshot next to this repo. The
-// bootstrap seed is the anchor round in .makefun/freshness.json, so the
-// build is reproducible from the repo alone.
+// With no flags it reads the sealed snapshot from $MAKEFUN_INPUT_DIR
+// (default /input, snapshot.json inside a directory) and writes to
+// $MAKEFUN_OUTPUT_DIR (default /output), so the grader can run it
+// no-args against a read-only repo. A bare positional argument still
+// names the snapshot, as before. The bootstrap seed is the anchor
+// round in .makefun/freshness.json, so the build is reproducible from
+// the repo alone.
 
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, copyFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -16,9 +20,35 @@ import { buildRadar, parseSnapshot } from "./lib/model.ts";
 import { boardFile, dataScript, dossierFile, dossierText } from "./lib/data.ts";
 
 const root = dirname(fileURLToPath(import.meta.url));
-const outDir = join(root, "out");
 const dashDir = join(root, "dashboard");
 const shotsDir = join(root, "screenshots");
+
+/** The command line as flags plus positionals: --name value and --name=value both land under name; a flag's value is never a positional. */
+function parseArgs(argv: string[]): { flags: Record<string, string>; positional: string[] } {
+  const flags: Record<string, string> = {};
+  const positional: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    if (!token.startsWith("--")) {
+      positional.push(token);
+      continue;
+    }
+    const eq = token.indexOf("=");
+    if (eq === -1) {
+      const name = token.slice(2);
+      if (name !== "" && i + 1 < argv.length && !(name in flags)) flags[name] = argv[++i]!;
+    } else {
+      const name = token.slice(2, eq);
+      if (name !== "" && !(name in flags)) flags[name] = token.slice(eq + 1);
+    }
+  }
+  return { flags, positional };
+}
+
+/** The snapshot path: a .json file as given, or snapshot.json inside a directory. */
+function snapshotPath(inputArg: string): string {
+  return inputArg.endsWith(".json") ? inputArg : join(inputArg, "snapshot.json");
+}
 
 function readJson(path: string): unknown {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -35,11 +65,16 @@ function anchorRound(): number {
 }
 
 function main(): void {
-  const snapPath = process.argv[2]
-    ?? join(root, "..", "token-radar-01-kit", "token-radar-01-kit", "input", "snapshot.json");
+  const { flags, positional } = parseArgs(process.argv.slice(2));
+  // Snapshot: --input, then a bare path, then $MAKEFUN_INPUT_DIR, then /input.
+  const inputArg = flags["input"] ?? positional[0] ?? process.env.MAKEFUN_INPUT_DIR ?? "/input";
+  const snapPath = snapshotPath(inputArg);
   if (!existsSync(snapPath)) {
-    throw new Error(`snapshot not found: ${snapPath} (pass its path as the first argument)`);
+    throw new Error(`snapshot not found: ${snapPath} (pass --input <snapshot.json|directory>, or mount the sealed /input)`);
   }
+  // Outputs: --output, then a second bare path, then $MAKEFUN_OUTPUT_DIR, then /output.
+  // Never inside the repo — the grader mounts it read-only.
+  const outDir = flags["output"] ?? positional[1] ?? process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
   const snap = parseSnapshot(readJson(snapPath));
   const radar = buildRadar(snap, anchorRound());
 
