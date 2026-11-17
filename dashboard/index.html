@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Radar — which launch is worth farming next?</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="dot"></span><h1>Token Radar</h1><span class="sub">which launch is worth farming next?</span></div>
+  <div class="meta" id="meta"></div>
+</header>
+<main>
+  <section class="stats" id="stats"></section>
+  <section class="how" id="how"></section>
+  <section class="farmnext" id="farmnext"></section>
+  <nav class="tabs" id="tabs">
+    <button data-tab="board" class="on">Pre-token board</button>
+    <button data-tab="anchors">Traded anchors</button>
+    <button data-tab="setaside">Set aside</button>
+    <button data-tab="method">Method &amp; backtest</button>
+  </nav>
+  <section class="controls" id="controls"></section>
+  <section class="pane" id="pane"></section>
+  <p class="agree" id="agree"></p>
+  <p class="foot">One model prices the board and this page, from the snapshot's own
+  figures — no name is hand-picked. A protocol records no token; the list
+  is DefiLlama's record, not proof it has none. Read the board as a ranking
+  and an order of magnitude, not a price. superbot.gg runs uncensored models
+  on your own computer.</p>
+</main>
+<dialog id="detail"></dialog>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
