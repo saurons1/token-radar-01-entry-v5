@@ -1,122 +1,93 @@
-// Token Radar v5 — program entrypoint (model "radar-6").
+// Token launch radar — full build.
+// Reads the snapshot, builds the radar, writes out/board.json and
+// out/data.js, mirrors the dashboard into out/, and bundles the dossier
+// (dashboard source + screenshots) into out/dossier.json.
 //
-// Reads the sealed snapshot, prices the board, writes the dashboard's data,
-// copies the dashboard and the screenshots, and builds the dossier with the
-// kit's buildDossier. Node 22, standard library only; no network. Two runs
-// write the same bytes: the bootstrap and the walk-forward use a seeded
-// generator where they resample, every sort is stable, and nothing reads
-// the clock.
+//   node main.ts [snapshot.json]
 //
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json>
-//
-// The output directory holds board.json, data.js, dashboard/, screenshots/
-// and dossier.json. The run prints one line per stage and a short summary
-// with the numbers the Method tab shows.
+// With no argument it reads the kit snapshot next to this repo. The
+// bootstrap seed is the anchor round in .makefun/freshness.json, so the
+// build is reproducible from the repo alone.
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { buildDossier } from './vendor/makefun-board.ts';
-import { boardFile, dataScript } from './lib/data.ts';
-import { buildRadar, parseSnapshot } from './lib/model.ts';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, copyFileSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { buildRadar, parseSnapshot } from "./lib/model.ts";
+import { boardFile, dataScript, dossierFile, dossierText } from "./lib/data.ts";
 
-const TEXT_CAP = 65536;
-const SHOT_CAP = 512 * 1024;
-const DASH_CAP = 4 * 1024 * 1024;
+const root = dirname(fileURLToPath(import.meta.url));
+const outDir = join(root, "out");
+const dashDir = join(root, "dashboard");
+const shotsDir = join(root, "screenshots");
 
-function die(message: string): never {
-  console.error(`token radar: ${message}`);
-  process.exit(1);
+function readJson(path: string): unknown {
+  return JSON.parse(readFileSync(path, "utf8"));
 }
 
-/** --input <file> and --output <dir>; MAKEFUN_OUTPUT_DIR is the fallback. */
-function parseArgs(argv: string[]): { input: string; output: string } {
-  let input = '';
-  let output = process.env.MAKEFUN_OUTPUT_DIR ?? '';
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--input' && i + 1 < argv.length) input = argv[++i]!;
-    else if (argv[i] === '--output' && i + 1 < argv.length) output = argv[++i]!;
-    else if (argv[i]!.startsWith('--input=')) input = argv[i]!.slice('--input='.length);
-    else if (argv[i]!.startsWith('--output=')) output = argv[i]!.slice('--output='.length);
+function anchorRound(): number {
+  try {
+    const fresh = readJson(join(root, ".makefun", "freshness.json")) as { round?: number };
+    if (typeof fresh.round === "number") return fresh.round;
+  } catch {
+    // No anchor file — fall back to the round this entry was anchored at.
   }
-  if (!input) die('pass --input <snapshot.json>');
-  if (!output) die('pass --output <dir> or set MAKEFUN_OUTPUT_DIR');
-  return { input, output };
-}
-
-function snapshotPath(inputArg: string): string {
-  if (existsSync(inputArg)) return inputArg;
-  const here = dirname(fileURLToPath(import.meta.url));
-  const kit = join(here, '..', 'input', 'snapshot.json');
-  if (existsSync(kit)) return kit;
-  return inputArg;
-}
-
-function mirrorDir(from: string, to: string): string[] {
-  mkdirSync(to, { recursive: true });
-  const copied: string[] = [];
-  for (const name of readdirSync(from)) {
-    const src = join(from, name);
-    const dst = join(to, name);
-    if (statSync(src).isDirectory()) {
-      copied.push(...mirrorDir(src, dst));
-    } else {
-      copyFileSync(src, dst);
-      copied.push(name);
-    }
-  }
-  return copied;
-}
-
-function checkShots(dir: string): string[] {
-  if (!existsSync(dir)) die(`screenshots/ is missing from ${dir}`);
-  const names = readdirSync(dir)
-    .filter((n) => !n.startsWith('.'))
-    .sort();
-  if (names.length < 3 || names.length > 4) die(`screenshots/ must hold 3 or 4 images, found ${names.length}`);
-  for (const n of names) {
-    const st = statSync(join(dir, n));
-    if (!st.isFile() || st.size > SHOT_CAP) die(`screenshot ${n} is not a file under 512 KiB`);
-    if (!/\.(png|jpg|jpeg)$/i.test(n)) die(`screenshot ${n} is not a PNG or JPEG`);
-  }
-  return names;
-}
-
-function fmtUsd(n: number): string {
-  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
-  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
-  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
-  return `$${n.toFixed(0)}`;
+  return 34038550;
 }
 
 function main(): void {
-  const { input, output } = parseArgs(process.argv.slice(2));
-  const here = dirname(fileURLToPath(import.meta.url));
-  const raw = JSON.parse(readFileSync(snapshotPath(input), 'utf8')) as unknown;
-  const snap = parseSnapshot(raw);
-  const radar = buildRadar(snap);
+  const snapPath = process.argv[2]
+    ?? join(root, "..", "token-radar-01-kit", "token-radar-01-kit", "input", "snapshot.json");
+  if (!existsSync(snapPath)) {
+    throw new Error(`snapshot not found: ${snapPath} (pass its path as the first argument)`);
+  }
+  const snap = parseSnapshot(readJson(snapPath));
+  const radar = buildRadar(snap, anchorRound());
 
-  mkdirSync(output, { recursive: true });
-  writeFileSync(join(output, 'board.json'), boardFile(radar));
-  writeFileSync(join(output, 'data.js'), dataScript(radar));
-  const dashFiles = mirrorDir(join(here, 'dashboard'), join(output, 'dashboard'));
-  const shots = checkShots(join(here, 'screenshots'));
-  mirrorDir(join(here, 'screenshots'), join(output, 'screenshots'));
-  const dossier = buildDossier(output, {
-    text_max_bytes: TEXT_CAP,
-    screenshots: { max: 4, max_bytes: SHOT_CAP },
-    dashboard: { max_files: 400, max_bytes: DASH_CAP },
+  mkdirSync(outDir, { recursive: true });
+  mkdirSync(join(outDir, "dashboard"), { recursive: true });
+  mkdirSync(join(outDir, "screenshots"), { recursive: true });
+
+  const board = boardFile(radar);
+  const data = dataScript(radar);
+  writeFileSync(join(outDir, "board.json"), board);
+  writeFileSync(join(outDir, "data.js"), data);
+
+  const dashFiles = readdirSync(dashDir).filter((f) => f.endsWith(".html") || f.endsWith(".js") || f.endsWith(".css")).sort();
+  for (const f of dashFiles) copyFileSync(join(dashDir, f), join(outDir, "dashboard", f));
+
+  const shotNames = existsSync(shotsDir)
+    ? readdirSync(shotsDir).filter((f) => f.endsWith(".png")).sort()
+    : [];
+  const images: string[] = [];
+  for (const f of shotNames) {
+    images.push(readFileSync(join(shotsDir, f)).toString("base64"));
+    copyFileSync(join(shotsDir, f), join(outDir, "screenshots", f));
+  }
+  if (images.length === 0) {
+    console.warn("warning: no screenshots in screenshots/ — dossier will carry no images");
+  }
+
+  const files = dashFiles.map((name) => {
+    const lang = name.endsWith(".css") ? "css" : name.endsWith(".js") ? "js" : "html";
+    return { name, lang, content: readFileSync(join(dashDir, name), "utf8") };
   });
-  writeFileSync(join(output, 'dossier.json'), dossier);
+  const text = dossierText(files);
+  const dossier = dossierFile(images, text);
+  writeFileSync(join(outDir, "dossier.json"), dossier);
 
   const v = radar.validation;
-  console.log(`token radar: ${snap.protocols.length} protocols, ${snap.watchlist.length} on the watchlist, ${radar.rows.length} rows scored (${radar.counts.preToken - radar.rows.length} pre-token set aside, ${radar.counts.traded} traded)`);
-  console.log(`token radar: first pass ${radar.counts.comps} comps, ${radar.counts.outliers} outliers set aside; curve log10(mcap) = ${v.fit.a.toFixed(4)} + ${v.fit.b.toFixed(4)}*log10(TVL) on ${v.fit.n} comparables, R2 ${v.fit.r2}`);
-  console.log(`token radar: LOO full x${v.loo.full.medianMiss} (no-category x${v.loo.noCategory.medianMiss}, no-momentum x${v.loo.noMomentum.medianMiss}, curve alone x${v.loo.curveOnly.medianMiss}, flat x${v.loo.flat.medianMiss}); time split 2024 x${v.split2024.full.medianMiss} (${v.split2024.pre}/${v.split2024.post}), 2025 x${v.split2025.full.medianMiss} (${v.split2025.pre}/${v.split2025.post})`);
-  console.log(`token radar: walk-forward overall x${v.walkForward.overall.medianMiss} (curve x${v.walkForward.overallCurve.medianMiss}); folds ${v.walkForward.folds.map((f) => `${f.boundary.slice(0, 4)} x${f.full.medianMiss}`).join(', ')}`);
-  console.log(`token radar: ridge cross-check x${v.ridge.medianMiss} (curve x${v.ridge.curveOnlyMiss}); tilts move ${v.tiltsMove} of ${radar.rows.length} ranks 5+ places; bootstrap ${v.bootstrapRefits} refits; term-selection rows ${v.termSelection.length}`);
-  console.log(`token radar: verdicts at $1,000 / 10% low end: FARM ${radar.verdicts.farm}, THIN ${radar.verdicts.thin}, SKIP ${radar.verdicts.skip} (point value: ${radar.pointVerdicts.farm}/${radar.pointVerdicts.thin}/${radar.pointVerdicts.skip}); top ${fmtUsd(radar.rows[0]!.implied_value_usd)} ${radar.rows[0]!.name}`);
-  console.log(`token radar: wrote ${output}/board.json, ${output}/data.js, ${output}/dashboard (${dashFiles.length} files), ${output}/screenshots (${shots.length} images) and ${output}/dossier.json`);
+  const top = radar.rows[0];
+  console.log(`rows ${radar.rows.length} (watchlist ${radar.counts.watchlistCovered}/${radar.counts.watchlist})`);
+  console.log(`comps ${radar.counts.comps} kept ${radar.counts.kept} outliers ${radar.counts.outliers}`);
+  console.log(`fit log10(mcap) = ${radar.fit.a.toFixed(4)} + ${radar.fit.b.toFixed(4)} log10(TVL), R2 ${radar.fit.r2}`);
+  console.log(`first pass a=${v.firstA} b=${v.firstB} sd=${v.firstSd}`);
+  console.log(`LOO full x${v.loo.full.medianMiss} curve x${v.loo.curveOnly.medianMiss} flat x${v.loo.flat.medianMiss}`);
+  console.log(`TS-2024 x${v.split2024.full.medianMiss} TS-2025 x${v.split2025.full.medianMiss}`);
+  console.log(`walk-forward overall x${v.walkForward.overall.medianMiss} curve x${v.walkForward.overallCurve.medianMiss}`);
+  console.log(`ridge x${v.ridge.medianMiss} (within3 ${v.ridge.within3}) tilts move ${v.tiltsMove} rows`);
+  console.log(`verdicts low-end FARM ${radar.verdicts.farm} THIN ${radar.verdicts.thin} SKIP ${radar.verdicts.skip} (point ${radar.pointVerdicts.farm}/${radar.pointVerdicts.thin}/${radar.pointVerdicts.skip})`);
+  console.log(`top ${top.name} $${top.implied_value_usd.toLocaleString("en-US")}`);
+  console.log(`data.js ${Buffer.byteLength(data, "utf8")} B, board.json ${Buffer.byteLength(board, "utf8")} B, dossier ${Buffer.byteLength(dossier, "utf8")} B`);
 }
 
 main();

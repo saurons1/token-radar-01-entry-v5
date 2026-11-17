@@ -1,1132 +1,361 @@
-// Token Radar v5 — model "radar-6".
+// Token launch radar — the model ("radar-6").
+// Builds the whole board from one DefiLlama snapshot: a log-log curve of
+// market cap on TVL fitted to the tokens that already trade, trimmed at
+// 1.5 sd, then four small tilts (category, momentum, seasoning, sibling).
+// Everything is validated blind — leave-one-out, two time splits and a
+// four-fold walk-forward — before any pre-token protocol is priced.
 //
-// One fitted log-log size curve prices every pre-token protocol off the
-// tokens that already trade. The curve is fitted twice: a first pass over
-// all 119 comparables (CEX excluded), the 16 beyond 1.5 sd of log residual
-// are set aside and named, and the curve is refit on the 103 that remain.
-// Each category carries a shrunk median-residual factor; growth and
-// seasoning are small by construction and their fitted slopes are reported,
-// not assumed.
-//
-// What v5 adds over v4 (radar-5), and why:
-//
-// - A walk-forward test. The comparables are ordered by listing date; for
-//   each of four yearly boundaries the curve and the factors are fitted on
-//   the tokens listed before the boundary and scored on the next year's
-//   cohort only. It is the honest test for a model whose job is pricing
-//   launches that do not exist yet, and it is reported alongside the
-//   leave-one-out test even where the two disagree (see Method).
-// - A term-selection table, computed live: every model term and every
-//   challenger (a chain factor, a two-segment curve, other trims, other
-//   strengths) is scored by the same strict leave-one-out, time-split and
-//   walk-forward tests, and a term stays only when the blind tests keep it.
-// - Deposit-sized farm plans: every plan is sized to one $1,000 deposit —
-//   the fund step moves that deposit onto the cheapest chain, the core
-//   action deposits the same $1,000, and the upkeep and exit are costed
-//   against it. (v4's plan funded "$100" and then deposited "$1,000".)
-//
-// The validation is STRICT, and the Method tab says so in plain words: in
-// the leave-one-out test every token is priced by a curve and category
-// factors refitted without it; in each time split and each walk-forward
-// fold the curve and the factors come from the earlier tokens only.
-// Tokens with no listing date are left out of the splits, never silently
-// assigned to one side.
-//
-// Nothing here is keyed to a name. Every number below is computed from the
-// snapshot at run time; rerun the program and the board, the data and the
-// dossier come back byte-identical.
+// Deterministic: same snapshot in, same bytes out. The only randomness is
+// the bootstrap, seeded from the anchor round.
 
-export interface Proto {
-  slug: string;
-  name: string;
-  category: string | null;
-  chains: string[];
-  tvl_usd: number;
-  change_7d: number | null;
-  mcap_usd: number | null;
-  listed_at: string | null;
-  gecko_id: string | null;
-  symbol: string | null;
-}
+import type {
+  Anchor, BlindSummary, BoardRow, Comp, FactorInfo, Outlier, Peer, PriceOpts,
+  Proto, SetAside,
+} from "../vendor/makefun-board.ts";
+import {
+  ageDays, categoryFactors, categorySource, chainFactors, cheapestOf,
+  curveValue, DEPOSIT, farmCostsFor, farmMinutesFor, farmStepsFor, firstWord,
+  holdDaysFor, isPreToken, mechanismFor, medianOf, missRatio, momentumFactor,
+  mulberry32, nearestPeers, NOT_A_LAUNCH, oddsFor, ols, quantile1,
+  round2, round4, sampleSd, seasoningFactor, sensitivityFor, summarizeMisses,
+  tbillFor, TRIM_SD, verdictFor, VERSION_RE, WRAPPED_WORDS, EXCHANGE_NAMES,
+  checkCountFor, sliceFor, MODEL_VERSION,
+} from "../vendor/makefun-board.ts";
 
-export interface Snap {
+export type Snapshot = {
   as_of: string;
   source: string;
   floor_usd: number;
   protocols: Proto[];
   watchlist: string[];
-}
+};
 
-/** One traded token: listings that share a token are merged, TVL summed. */
-export interface Token {
-  token: string;
-  slug: string;
-  name: string;
-  category: string;
-  tvl: number;
-  mcap: number;
-  change_7d: number;
-  listed_at: string | null;
-  chains: string[];
-  symbol: string;
-  listings: number;
-}
-
-export interface CurveFit {
-  a: number;
-  b: number;
-  n: number;
-  r2: number;
-}
-
-export interface CatFactor {
-  n: number;
-  factor: number;
-  medianResidual: number;
-}
-
-export interface OutlierNote {
-  name: string;
-  slug: string;
-  residual: number;
-}
-
-export interface Backtest {
-  n: number;
-  medianMiss: number;
-  within3: number;
-  within10: number;
-}
-
-export interface Ablation {
-  full: Backtest;
-  noMomentum: Backtest;
-  noCategory: Backtest;
-  curveOnly: Backtest;
-  flat: Backtest;
-}
-
-export interface SplitResult {
-  cutoff: string;
-  pre: number;
-  post: number;
-  full: Backtest;
-  curveOnly: Backtest;
-  flat: Backtest;
-}
-
-export interface AgeSplit {
-  months: number;
-  young: Backtest;
-  old: Backtest;
-}
-
-export interface SlopeCheck {
-  slope: number;
-  t: number;
-  r: number;
-}
-
-export interface RidgeCheck {
-  lambda: number;
-  n: number;
-  medianMiss: number;
-  within3: number;
-  curveOnlyMiss: number;
-}
-
-export interface WalkFold {
-  boundary: string;
-  train: number;
-  test: number;
-  full: Backtest;
-  curveOnly: Backtest;
-}
-
-export interface WalkForward {
-  folds: WalkFold[];
-  overall: Backtest;
-  overallCurve: Backtest;
-  earlyOverall: Backtest;
-  earlyCurve: Backtest;
-}
-
-export interface TermRow {
+export type TermRow = {
   term: string;
   loo: number;
   split2024: number;
   split2025: number;
   walkForward: number;
   verdict: string;
-}
+};
 
-export interface Validation {
+export type FoldResult = {
+  boundary: string;
+  train: number;
+  test: number;
+  full: BlindSummary;
+  curveOnly: BlindSummary;
+};
+
+export type Validation = {
   firstA: number;
   firstB: number;
   firstSd: number;
-  fit: CurveFit;
-  outliers: OutlierNote[];
-  categories: Record<string, CatFactor>;
-  loo: Ablation;
-  split2024: SplitResult;
-  split2025: SplitResult;
-  ageSplit: AgeSplit;
-  growthSlope: SlopeCheck;
-  ageSlope: SlopeCheck;
+  fit: { a: number; b: number; n: number; r2: number };
+  outliers: Outlier[];
+  categories: Record<string, { n: number; factor: number; medianResidual: number }>;
+  loo: {
+    full: BlindSummary;
+    noMomentum: BlindSummary;
+    noCategory: BlindSummary;
+    curveOnly: BlindSummary;
+    flat: BlindSummary;
+  };
+  split2024: { cutoff: string; pre: number; post: number; full: BlindSummary; curveOnly: BlindSummary; flat: BlindSummary };
+  split2025: { cutoff: string; pre: number; post: number; full: BlindSummary; curveOnly: BlindSummary; flat: BlindSummary };
+  ageSplit: { months: number; young: BlindSummary; old: BlindSummary };
+  growthSlope: { slope: number; t: number; r: number };
+  ageSlope: { slope: number; t: number; r: number };
   quantiles: { p10: number; p25: number; p50: number; p75: number; p90: number };
-  ridge: RidgeCheck;
-  walkForward: WalkForward;
+  ridge: { lambda: number; n: number; medianMiss: number; within3: number; curveOnlyMiss: number };
+  walkForward: {
+    folds: FoldResult[];
+    overall: BlindSummary;
+    overallCurve: BlindSummary;
+    earlyOverall: BlindSummary;
+    earlyCurve: BlindSummary;
+  };
   termSelection: TermRow[];
   onePerTicker: { duplicates: string; keptDistinct: number; note: string };
   bootstrapRefits: number;
   tiltsMove: number;
   marketChange7d: number;
-}
+};
 
-export interface FarmStep {
-  text: string;
-  costUsd: number;
-  minutes: number;
-}
-
-export interface Peer {
-  slug: string;
-  name: string;
-  tvl: number;
-  mcap: number;
-  ratio: number;
-}
-
-export interface BoardRow {
-  slug: string;
-  name: string;
-  category: string;
-  mechanism: string;
-  chains: string[];
-  tvl_usd: number;
-  change_7d: number | null;
-  age_days: number | null;
-  listed_at: string | null;
-  token_status: 'pre-token' | 'trades';
-  rank: number;
-  rank_lo: number;
-  rank_hi: number;
-  implied_value_usd: number;
-  curve_usd: number;
-  p10_usd: number;
-  p25_usd: number;
-  p75_usd: number;
-  p90_usd: number;
-  low_usd: number;
-  slice_usd: number;
-  slice_low_usd: number;
-  fees_usd: number;
-  gas_usd: number;
-  cheapest_chain: string;
-  hold_days: number;
-  tbill_usd: number;
-  net_usd: number;
-  net_low_usd: number;
-  odds: number;
-  per_hour_usd: number;
-  per_hour_low_usd: number;
-  hours: number;
-  verdict: 'FARM' | 'THIN' | 'SKIP';
-  farm_steps: string[];
-  farm_costs_usd: number[];
-  farm_minutes: number[];
-  sensitivity: { drops: number[]; capitals: number[]; net: number[][] };
-  peers: Peer[];
-  model: {
-    curve_usd: number;
-    category: number;
-    category_n: number;
-    category_source: string;
-    momentum: number;
-    seasoning: number;
-    sibling: number;
-  };
-}
-
-export interface AnchorRow {
-  slug: string;
-  name: string;
-  category: string;
-  tvl: number;
-  mcap: number;
-  multiple: number;
-  change_7d: number | null;
-  listed_at: string | null;
-}
-
-export interface SetAsideRow {
-  slug: string;
-  name: string;
-  category: string | null;
-  tvl: number;
-  reason: string;
-}
-
-export interface FarmNextCard {
-  slug: string;
-  name: string;
-  rank: number;
-  mechanism: string;
-  net_usd: number;
-  net_low_usd: number;
-  gas_usd: number;
-  hours: number;
-  per_hour_usd: number;
-  per_hour_low_usd: number;
-  odds: number;
-}
-
-export interface RadarData {
+export type Radar = {
   asOf: string;
   modelVersion: string;
   watchlist: string[];
   counts: {
-    protocols: number;
-    preToken: number;
-    ranked: number;
-    watchlist: number;
-    watchlistCovered: number;
-    comps: number;
-    kept: number;
-    outliers: number;
-    setAside: number;
-    traded: number;
+    protocols: number; preToken: number; ranked: number; watchlist: number;
+    watchlistCovered: number; comps: number; kept: number; outliers: number;
+    setAside: number; traded: number;
   };
   verdicts: { farm: number; thin: number; skip: number };
   pointVerdicts: { farm: number; thin: number; skip: number };
-  fit: CurveFit;
-  outliers: OutlierNote[];
-  categories: Record<string, CatFactor>;
+  fit: { a: number; b: number; n: number; r2: number };
+  outliers: Outlier[];
+  categories: Record<string, { n: number; factor: number; medianResidual: number }>;
   validation: Validation;
   rows: BoardRow[];
-  anchors: AnchorRow[];
-  setAside: SetAsideRow[];
-  farmNext: FarmNextCard[];
-  bestPerHourWatchlist: { name: string; slug: string; perHour: number } | null;
+  anchors: Anchor[];
+  setAside: SetAside[];
+  farmNext: Array<{
+    slug: string; name: string; rank: number; mechanism: string;
+    net_usd: number; net_low_usd: number; gas_usd: number; hours: number;
+    per_hour_usd: number; per_hour_low_usd: number; odds: number;
+  }>;
+  bestPerHourWatchlist: { name: string; slug: string; perHour: number };
   totalImpliedUsd: number;
   headline: string;
-}
+};
 
-export const MODEL_VERSION = 'radar-6';
+// ---- snapshot ---------------------------------------------------------
 
-/** Every tunable number in one place, so the Method tab can quote them. */
-export const TUNE = {
-  trimSd: 1.5,
-  shrinkExtra: 4,
-  minCategoryN: 3,
-  momentumCoef: 0.4,
-  momentumLoPct: -60,
-  momentumHiPct: 120,
-  seasoningBase: 0.8,
-  seasoningSpan: 0.2,
-  seasoningCapDays: 1095,
-  unknownAgeDays: 365,
-  split2024: '2024-01-01',
-  split2025: '2025-01-01',
-  walkBounds: ['2023-01-01', '2024-01-01', '2025-01-01', '2026-01-01'],
-  ageSplitMonths: 18,
-  tbillRate: 0.04,
-  airdropShare: 0.1,
-  capitalUsd: 1000,
-  bridgeUsd: 1.5,
-  bootstrapRefits: 200,
-  peerCount: 4,
-  ridgeLambda: 10,
-} as const;
-
-// ------------------------------------------------------------------ helpers
-
-export function clampNum(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
-
-export function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
-
-export function round4(n: number): number {
-  return Math.round(n * 1e4) / 1e4;
-}
-
-export function medianOf(values: number[]): number {
-  const s = [...values].sort((a, b) => a - b);
-  const n = s.length;
-  if (n === 0) return 0;
-  return n % 2 === 1 ? s[(n - 1) / 2]! : (s[n / 2 - 1]! + s[n / 2]!) / 2;
-}
-
-export function quantileOf(sortedAsc: number[], p: number): number {
-  if (sortedAsc.length === 0) return 0;
-  const idx = (sortedAsc.length - 1) * p;
-  const lo = Math.floor(idx);
-  const hi = Math.ceil(idx);
-  if (lo === hi) return sortedAsc[lo]!;
-  return sortedAsc[lo]! + (sortedAsc[hi]! - sortedAsc[lo]!) * (idx - lo);
-}
-
-export function popSd(values: number[]): number {
-  if (values.length < 2) return 0;
-  const m = values.reduce((a, b) => a + b, 0) / values.length;
-  return Math.sqrt(values.reduce((a, b) => a + (b - m) * (b - m), 0) / (values.length - 1));
-}
-
-/** Days from a listing date to the snapshot date; null stays null. */
-export function ageInDays(asOf: string, listedAt: string | null): number | null {
-  if (!listedAt) return null;
-  const ms = Date.parse(asOf) - Date.parse(listedAt);
-  if (!Number.isFinite(ms)) return null;
-  return Math.max(0, Math.floor(ms / 86400000));
-}
-
-export function firstWord(name: string): string {
-  const w = (name || '').trim().split(/\s+/)[0];
-  return (w || '').toLowerCase();
-}
-
-/** Standard normal CDF (Abramowitz & Stegun 7.1.26, |error| < 1.5e-7). */
-export function normCdf(x: number): number {
-  const t = 1 / (1 + 0.2316419 * Math.abs(x));
-  const d = 0.3989423 * Math.exp(-(x * x) / 2);
-  const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
-  return x > 0 ? 1 - p : p;
-}
-
-/** Deterministic PRNG (mulberry32) so a rebuild is byte-identical. */
-export function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** Small dense linear solve (Gaussian elimination with partial pivoting). */
-export function solveLinear(a: number[][], b: number[]): number[] {
-  const n = b.length;
-  const m = a.map((row, i) => [...row, b[i]!]);
-  for (let col = 0; col < n; col++) {
-    let piv = col;
-    for (let r = col + 1; r < n; r++) if (Math.abs(m[r]![col]!) > Math.abs(m[piv]![col]!)) piv = r;
-    const tmp = m[col]!;
-    m[col] = m[piv]!;
-    m[piv] = tmp;
-    const div = m[col]![col]!;
-    if (Math.abs(div) < 1e-12) continue;
-    for (let r = col + 1; r < n; r++) {
-      const f = m[r]![col]! / div;
-      for (let c = col; c <= n; c++) m[r]![c] = m[r]![c]! - f * m[col]![c]!;
-    }
-  }
-  const x = new Array<number>(n).fill(0);
-  for (let r = n - 1; r >= 0; r--) {
-    let s = m[r]![n]!;
-    for (let c = r + 1; c < n; c++) s -= m[r]![c]! * x[c]!;
-    x[r] = Math.abs(m[r]![r]!) < 1e-12 ? 0 : s / m[r]![r]!;
-  }
-  return x;
-}
-
-// ------------------------------------------------------------------ snapshot
-
-export class SnapshotError extends Error {}
-
-function finiteNum(v: unknown, fallback: number): number {
-  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
-}
-
-export function parseSnapshot(raw: unknown): Snap {
-  if (typeof raw !== 'object' || raw === null) throw new SnapshotError('snapshot is not an object');
-  const s = raw as Record<string, unknown>;
-  if (!Array.isArray(s.protocols) || !Array.isArray(s.watchlist)) {
-    throw new SnapshotError('snapshot is missing protocols or watchlist');
-  }
-  const protocols: Proto[] = (s.protocols as Record<string, unknown>[]).map((p) => ({
-    slug: String(p.slug ?? ''),
-    name: String(p.name ?? ''),
-    category: typeof p.category === 'string' ? p.category : null,
-    chains: Array.isArray(p.chains) ? (p.chains as unknown[]).map((c) => String(c)) : [],
-    tvl_usd: finiteNum(p.tvl_usd, 0),
-    change_7d: typeof p.change_7d === 'number' ? p.change_7d : null,
-    mcap_usd: typeof p.mcap_usd === 'number' ? p.mcap_usd : null,
-    listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
-    gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
-    symbol: typeof p.symbol === 'string' ? p.symbol : null,
-  }));
+export function parseSnapshot(raw: unknown): Snapshot {
+  const r = raw as Record<string, unknown>;
+  const protos = Array.isArray(r.protocols) ? r.protocols : [];
+  const protocols: Proto[] = protos.map((p) => {
+    const q = p as Record<string, unknown>;
+    const chains = Array.isArray(q.chains) ? (q.chains as unknown[]).map(String) : [];
+    return {
+      slug: String(q.slug ?? ""),
+      name: String(q.name ?? ""),
+      category: String(q.category ?? ""),
+      chains,
+      tvl_usd: typeof q.tvl_usd === "number" ? q.tvl_usd : 0,
+      change_7d: typeof q.change_7d === "number" ? q.change_7d : null,
+      mcap_usd: typeof q.mcap_usd === "number" ? q.mcap_usd : null,
+      listed_at: typeof q.listed_at === "string" ? q.listed_at : null,
+      gecko_id: typeof q.gecko_id === "string" ? q.gecko_id : null,
+      symbol: typeof q.symbol === "string" ? q.symbol : null,
+    };
+  });
   return {
-    as_of: String(s.as_of ?? ''),
-    source: String(s.source ?? ''),
-    floor_usd: finiteNum(s.floor_usd, 50000000),
+    as_of: String(r.as_of ?? ""),
+    source: String(r.source ?? ""),
+    floor_usd: typeof r.floor_usd === "number" ? r.floor_usd : 0,
     protocols,
-    watchlist: (s.watchlist as unknown[]).map((w) => String(w)),
+    watchlist: Array.isArray(r.watchlist) ? (r.watchlist as unknown[]).map(String) : [],
   };
 }
 
-/** A protocol records no token on the snapshot. */
-export function isPreToken(p: Proto): boolean {
-  return p.gecko_id === null && p.symbol === null;
-}
+// ---- comps ------------------------------------------------------------
 
-const EXCLUDED_CATEGORIES = new Set([
-  'Bridge',
-  'Canonical Bridge',
-  'Liquid Staking',
-  'Liquid Restaking',
-  'Restaked BTC',
-  'CEX',
-]);
-
-const EXCHANGE_PREFIXES = ['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini'];
-
-function versionedName(name: string): boolean {
-  // A version marker is " V2", " v2" or " 2.0" at the end — a bare trailing
-  // number ("Project 0") is a name, not a version.
-  return /\s[vV]\d+(\.\d+)?\s*$/.test(name || '') || /\s\d+\.\d+(\.\d+)?\s*$/.test(name || '');
-}
-
-function wrappedOrStaked(name: string): boolean {
-  return /\b(wrapped|staked|staking)\b/i.test(name || '');
-}
-
-/**
- * The watchlist's own rule, applied to every pre-token protocol: the
- * watchlist is the floor, never the ceiling, so a protocol below the floor
- * is still rankable — only the rule's exclusions keep one off the board.
- * Returns null when rankable, else the reason it is set aside.
- */
-export function rankableReason(p: Proto): string | null {
-  if (!isPreToken(p)) return 'its token already trades';
-  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return `category ${p.category} is not a launch`;
-  if (versionedName(p.name)) return 'versioned listing (V2, 2.0, …)';
-  if (wrappedOrStaked(p.name)) return 'wrapped or staked product of a token that trades';
-  for (const ex of EXCHANGE_PREFIXES) {
-    if (p.name.startsWith(ex)) return `begins with the exchange name ${ex}`;
-  }
-  return null;
-}
-
-export function isRankable(p: Proto): boolean {
-  return rankableReason(p) === null;
-}
-
-// ------------------------------------------------------------------ comparables
-
-export interface CompSet {
-  tokens: Token[];
-  /** One observation per ticker: the tickers that appear twice, if any. */
-  duplicateSymbols: { symbol: string; names: string[] }[];
-}
-
-/**
- * One row per traded token: listings that share a token are merged with
- * their TVL summed. CEX listings are the only exclusion: an exchange's own
- * token is not a comparable launch. The duplicate-ticker check is reported
- * alongside: a token listed twice must not pull the curve twice.
- */
-export function collectTokens(snap: Snap): CompSet {
-  const byToken = new Map<string, Token>();
-  for (const p of snap.protocols) {
-    if (!p.mcap_usd || p.mcap_usd <= 0) continue;
-    if (p.category === 'CEX') continue;
+// Tokens that already trade, merged by identity: a CoinGecko id when the
+// protocol has one, otherwise its ticker (or its slug when even that is
+// missing). Merging sums TVL and keeps the first protocol's other fields.
+export function buildComps(protocols: Proto[]): Comp[] {
+  const byKey = new Map<string, Comp>();
+  const sorted = [...protocols].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  for (const p of sorted) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0) continue;
+    if (p.category === "CEX") continue;
     const key = p.gecko_id ?? `sym:${p.symbol ?? p.slug}`;
-    const prev = byToken.get(key);
-    if (!prev) {
-      byToken.set(key, {
-        token: key,
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.tvl += p.tvl_usd;
+    } else {
+      byKey.set(key, {
         slug: p.slug,
         name: p.name,
-        category: p.category ?? 'Other',
+        category: p.category,
+        chains: p.chains,
         tvl: p.tvl_usd,
         mcap: p.mcap_usd,
-        change_7d: p.change_7d ?? 0,
-        listed_at: p.listed_at,
-        chains: p.chains,
-        symbol: (p.symbol ?? '').toLowerCase(),
-        listings: 1,
+        ch: p.change_7d ?? 0,
+        listed: p.listed_at,
+        symbol: (p.symbol ?? "").toUpperCase(),
       });
-    } else {
-      prev.tvl += p.tvl_usd;
-      prev.listings += 1;
-      if (p.tvl_usd > prev.tvl - p.tvl_usd) {
-        prev.slug = p.slug;
-        prev.name = p.name;
-        prev.category = p.category ?? 'Other';
-      }
-      if (prev.listed_at === null || (p.listed_at !== null && p.listed_at < prev.listed_at)) {
-        prev.listed_at = p.listed_at;
-      }
-      if (p.chains.length > 0 && prev.chains.length === 0) prev.chains = p.chains;
     }
   }
-  const tokens = [...byToken.values()].sort((a, b) => (a.slug < b.slug ? -1 : 1));
-  const bySymbol = new Map<string, string[]>();
-  for (const t of tokens) {
-    if (!t.symbol) continue;
-    const list = bySymbol.get(t.symbol) ?? [];
-    list.push(t.name);
-    bySymbol.set(t.symbol, list);
-  }
-  const duplicateSymbols = [...bySymbol.entries()]
-    .filter(([, names]) => names.length > 1)
-    .map(([symbol, names]) => ({ symbol, names: [...names].sort() }));
-  return { tokens, duplicateSymbols };
+  return [...byKey.values()].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
 }
 
-/** The same comp set with each ticker kept once (largest TVL wins). */
-export function dedupBySymbol(tokens: Token[]): Token[] {
-  const best = new Map<string, Token>();
-  for (const t of tokens) {
-    if (!t.symbol) continue;
-    const prev = best.get(t.symbol);
-    if (!prev || t.tvl > prev.tvl) best.set(t.symbol, t);
-  }
-  const kept = new Set([...best.values()].map((t) => t.token));
-  return tokens.filter((t) => !t.symbol || kept.has(t.token));
-}
-
-// ------------------------------------------------------------------ the curve
-
-export function olsLine(points: { x: number; y: number }[]): { a: number; b: number } {
-  const n = points.length;
-  let sx = 0;
-  let sy = 0;
-  let sxx = 0;
-  let sxy = 0;
-  for (const p of points) {
-    sx += p.x;
-    sy += p.y;
-    sxx += p.x * p.x;
-    sxy += p.x * p.y;
-  }
-  const den = n * sxx - sx * sx;
-  const b = den === 0 ? 0 : (n * sxy - sx * sy) / den;
-  const a = (sy - b * sx) / n;
-  return { a, b };
-}
-
-export function curveR2(tokens: Token[], fit: { a: number; b: number }): number {
-  const ys = tokens.map((t) => Math.log10(t.mcap));
-  const mean = ys.reduce((x, y) => x + y, 0) / ys.length;
-  let ssTot = 0;
-  let ssRes = 0;
-  for (const t of tokens) {
-    const pred = fit.a + fit.b * Math.log10(t.tvl);
-    ssTot += (Math.log10(t.mcap) - mean) ** 2;
-    ssRes += (Math.log10(t.mcap) - pred) ** 2;
-  }
-  return ssTot === 0 ? 0 : 1 - ssRes / ssTot;
-}
-
-function curveResidual(t: Token, fit: { a: number; b: number }): number {
-  return Math.log10(t.mcap) - (fit.a + fit.b * Math.log10(t.tvl));
-}
-
-/**
- * Two-pass fit: fit once on every comparable, set aside the ones beyond
- * trimSd of log residual, refit on the rest. Returns both fits and the
- * named outliers, so the Method tab can list exactly what was dropped.
- */
-export function fitTwice(all: Token[], trimSd: number = TUNE.trimSd): {
-  first: { a: number; b: number };
+export type FitResult = {
+  firstA: number;
+  firstB: number;
   firstSd: number;
-  kept: Token[];
-  outliers: OutlierNote[];
-  fit: CurveFit;
-} {
-  const first = olsLine(all.map((t) => ({ x: Math.log10(t.tvl), y: Math.log10(t.mcap) })));
-  const residuals = all.map((t) => curveResidual(t, first));
-  const firstSd = popSd(residuals);
-  const kept: Token[] = [];
-  const outliers: OutlierNote[] = [];
-  for (let i = 0; i < all.length; i++) {
-    if (Math.abs(residuals[i]!) > trimSd * firstSd) {
-      outliers.push({ name: all[i]!.name, slug: all[i]!.slug, residual: round4(residuals[i]!) });
+  fit: { a: number; b: number; n: number; r2: number };
+  kept: Comp[];
+  outliers: Outlier[];
+};
+
+// Two-pass fit: OLS on every comp, drop anything more than TRIM_SD sample
+// deviations out in log space, refit on what survives.
+export function fitAndTrim(comps: Comp[], trimSd: number): FitResult {
+  const pts = comps.map((t) => [Math.log10(t.tvl), Math.log10(t.mcap)] as [number, number]);
+  const first = ols(pts);
+  const res = comps.map((t) => Math.log10(t.mcap) - (first.a + first.b * Math.log10(t.tvl)));
+  const sd = sampleSd(res);
+  const kept: Comp[] = [];
+  const outliers: Outlier[] = [];
+  comps.forEach((t, i) => {
+    if (Math.abs(res[i]) > trimSd * sd) {
+      outliers.push({ name: t.name, slug: t.slug, residual: round4(res[i]) });
     } else {
-      kept.push(all[i]!);
+      kept.push(t);
     }
-  }
+  });
   outliers.sort((a, b) => Math.abs(b.residual) - Math.abs(a.residual));
-  const second = olsLine(kept.map((t) => ({ x: Math.log10(t.tvl), y: Math.log10(t.mcap) })));
-  // a and b stay full-precision for pricing; the page rounds them for display.
-  const fit: CurveFit = {
-    a: second.a,
-    b: second.b,
-    n: kept.length,
-    r2: round4(curveR2(kept, second)),
-  };
-  return { first, firstSd, kept, outliers, fit };
-}
-
-/**
- * One category's factor: the median log residual of its traded tokens,
- * shrunk toward the curve as if `shrinkExtra` more tokens sat on it.
- * Fewer than minCategoryN tokens, or no tokens at all: the curve alone.
- */
-export function categoryFactors(kept: Token[], fit: { a: number; b: number }): Record<string, CatFactor> {
-  const byCat = new Map<string, number[]>();
-  for (const t of kept) {
-    const list = byCat.get(t.category) ?? [];
-    list.push(curveResidual(t, fit));
-    byCat.set(t.category, list);
-  }
-  const out: Record<string, CatFactor> = {};
-  for (const [cat, res] of byCat) {
-    const med = medianOf(res);
-    const n = res.length;
-    const factor = n < TUNE.minCategoryN ? 1 : 10 ** (med * (n / (n + TUNE.shrinkExtra)));
-    out[cat] = { n, factor: round4(factor), medianResidual: round4(med) };
-  }
-  return out;
-}
-
-/**
- * The same shrunk-median construction, by first chain instead of by
- * category. It is a challenger, not a term: the term-selection table
- * scores it against the same blind tests, and it loses on every one.
- */
-export function chainFactors(kept: Token[], fit: { a: number; b: number }): Record<string, CatFactor> {
-  const byChain = new Map<string, number[]>();
-  for (const t of kept) {
-    const chain = t.chains.length > 0 ? t.chains[0]! : 'none';
-    const list = byChain.get(chain) ?? [];
-    list.push(curveResidual(t, fit));
-    byChain.set(chain, list);
-  }
-  const out: Record<string, CatFactor> = {};
-  for (const [chain, res] of byChain) {
-    const med = medianOf(res);
-    const n = res.length;
-    const factor = n < TUNE.minCategoryN ? 1 : 10 ** (med * (n / (n + TUNE.shrinkExtra)));
-    out[chain] = { n, factor: round4(factor), medianResidual: round4(med) };
-  }
-  return out;
-}
-
-// ------------------------------------------------------------------ pricing
-
-/** Which layers of the model a price uses; the term-selection table varies these. */
-export interface PriceOptions {
-  momentum?: boolean;
-  momentumCoef?: number;
-  category?: boolean;
-  seasoning?: boolean;
-  seasoningSpan?: number;
-  sibling?: boolean;
-  siblingMult?: number;
-  chain?: boolean;
-  chainFactors?: Record<string, CatFactor>;
-}
-
-function momentumOf(change7dPct: number, coef: number): number {
-  // change_7d is stored in percent points (+2.37 means +2.37%), so the
-  // clamp runs on the percent figure directly.
-  return 1 + coef * (clampNum(change7dPct, TUNE.momentumLoPct, TUNE.momentumHiPct) / 100);
-}
-
-function seasoningOf(age: number | null, span: number): number {
-  const days = age ?? TUNE.unknownAgeDays;
-  return TUNE.seasoningBase + span * (Math.min(days, TUNE.seasoningCapDays) / TUNE.seasoningCapDays);
-}
-
-function siblingOf(name: string, names: Set<string>, mult: number): number {
-  return names.has(firstWord(name)) ? mult : 1;
-}
-
-export interface PriceParts {
-  curve: number;
-  category: number;
-  categoryN: number;
-  categorySource: string;
-  momentum: number;
-  seasoning: number;
-  sibling: number;
-  value: number;
-}
-
-/** The full model price for one protocol, under the given options. */
-export function priceProtocol(
-  tvl: number,
-  change7d: number,
-  age: number | null,
-  name: string,
-  category: string,
-  chains: string[],
-  fit: { a: number; b: number },
-  factors: Record<string, CatFactor>,
-  tradedFirstWords: Set<string>,
-  opts: PriceOptions = {},
-): PriceParts {
-  const curve = 10 ** (fit.a + fit.b * Math.log10(tvl));
-  const useCategory = opts.category !== false;
-  const fac = factors[category];
-  const catFactor = !useCategory ? 1 : fac ? fac.factor : 1;
-  const categoryN = fac ? fac.n : 0;
-  const categorySource =
-    !fac || fac.n === 0
-      ? 'no traded token in this category — the curve alone'
-      : fac.n < TUNE.minCategoryN
-        ? `only ${fac.n} traded token${fac.n === 1 ? '' : 's'} — too few to move the curve`
-        : `${fac.n} traded tokens, median residual shrunk ${fac.n}/${fac.n + TUNE.shrinkExtra}`;
-  const momentum = opts.momentum === false ? 1 : round4(momentumOf(change7d, opts.momentumCoef ?? TUNE.momentumCoef));
-  const seasoning = opts.seasoning === false ? 1 : round4(seasoningOf(age, opts.seasoningSpan ?? TUNE.seasoningSpan));
-  const sibling = opts.sibling === false ? 1 : siblingOf(name, tradedFirstWords, opts.siblingMult ?? 0.5);
-  let value = curve * catFactor * momentum * seasoning * sibling;
-  if (opts.chain && opts.chainFactors) {
-    const chain = chains.length > 0 ? chains[0]! : 'none';
-    value *= opts.chainFactors[chain]?.factor ?? 1;
-  }
+  const keptPts = kept.map((t) => [Math.log10(t.tvl), Math.log10(t.mcap)] as [number, number]);
+  const f = ols(keptPts);
+  const ys = kept.map((t) => Math.log10(t.mcap));
+  const meanY = ys.reduce((s, v) => s + v, 0) / Math.max(1, ys.length);
+  let ssRes = 0, ssTot = 0;
+  kept.forEach((t, i) => {
+    const pred = f.a + f.b * keptPts[i][0];
+    ssRes += (ys[i] - pred) ** 2;
+    ssTot += (ys[i] - meanY) ** 2;
+  });
+  const r2 = ssTot === 0 ? 0 : 1 - ssRes / ssTot;
   return {
-    curve: round2(curve),
-    category: round4(catFactor),
-    categoryN,
-    categorySource,
-    momentum,
-    seasoning,
-    sibling,
-    value: Math.max(1, Math.round(value)),
+    firstA: round4(first.a),
+    firstB: round4(first.b),
+    firstSd: round4(sd),
+    fit: { a: f.a, b: f.b, n: kept.length, r2: round4(r2) },
+    kept,
+    outliers,
   };
 }
 
-function missOf(predicted: number, actual: number): number {
-  return Math.max(predicted / actual, actual / predicted);
+// First words of a comp set. A protocol is a sibling of a token that
+// already trades when its name starts with one of these words — the market
+// rarely pays twice for the same brand. For a comp, pass the set WITHOUT
+// the comp itself, so only a word another comp shares counts; for a
+// pre-token row, pass the whole kept set.
+export function siblingWords(comps: Comp[]): Set<string> {
+  return new Set(comps.map((t) => firstWord(t.name)).filter(Boolean));
 }
 
-function summarizeMisses(misses: number[]): Backtest {
-  const sorted = [...misses].sort((a, b) => a - b);
-  return {
-    n: misses.length,
-    medianMiss: round4(medianOf(misses)),
-    within3: round4(misses.filter((m) => m <= 3).length / Math.max(1, misses.length)),
-    within10: round4(misses.filter((m) => m <= 10).length / Math.max(1, misses.length)),
-  };
+export function medianMultiple(comps: Comp[]): number {
+  return medianOf(comps.map((t) => t.mcap / t.tvl));
 }
 
-/** Price one traded token under an option set, from a fitted curve + factors. */
-function priceToken(
-  t: Token,
-  fit: { a: number; b: number },
-  factors: Record<string, CatFactor>,
-  words: Set<string>,
-  asOf: string,
-  opts: PriceOptions,
-  chainFac?: Record<string, CatFactor>,
+// Price one comp under an option set, given a fit, factors and sibling
+// words that were all trained without it (for blind tests). By default the
+// factors are the STORED ones — curve to 2dp, the rest to 4dp — the same
+// rounding the board rows are priced from, so a blind test prices exactly
+// what the board would show. Pass { rounded: false } for the fitted
+// model's own residuals, which are measured at full precision.
+function priceBlind(
+  t: Comp, fit: { a: number; b: number }, factors: Map<string, FactorInfo>,
+  words: Set<string>, opts: PriceOpts, asOf: string,
+  chainFac?: Map<string, FactorInfo>,
 ): number {
-  const parts = priceProtocol(
-    t.tvl,
-    t.change_7d,
-    ageInDays(asOf, t.listed_at),
-    t.name,
-    t.category,
-    t.chains,
-    fit,
-    factors,
-    words,
-    { ...opts, chainFactors: chainFac },
-  );
-  return parts.value;
-}
-
-// ------------------------------------------------------------------ strict validation
-
-/**
- * Leave-one-out, strict: for every token the curve AND the category
- * factors (and the chain factors, when the options ask for them) are
- * refitted on the other tokens only. Returns the full model, the curve
- * alone and one flat multiple under the same folds, so the three compare
- * like with like.
- */
-export function looFull(
-  kept: Token[],
-  asOf: string,
-  opts: PriceOptions = {},
-): { full: Backtest; curveOnly: Backtest; flat: Backtest } {
-  const full: number[] = [];
-  const curveOnly: number[] = [];
-  const flat: number[] = [];
-  const flatMultiple = medianOf(kept.map((t) => t.mcap / t.tvl));
-  for (let i = 0; i < kept.length; i++) {
-    const held = kept[i]!;
-    const rest = kept.filter((_, j) => j !== i);
-    const fit = olsLine(rest.map((t) => ({ x: Math.log10(t.tvl), y: Math.log10(t.mcap) })));
-    const factors = categoryFactors(rest, fit);
-    const words = new Set(rest.map((t) => firstWord(t.name)));
-    const chainFac = opts.chain ? chainFactors(rest, fit) : undefined;
-    full.push(missOf(priceToken(held, fit, factors, words, asOf, opts, chainFac), held.mcap));
-    const base = 10 ** (fit.a + fit.b * Math.log10(held.tvl));
-    curveOnly.push(missOf(base, held.mcap));
-    flat.push(missOf(held.tvl * flatMultiple, held.mcap));
+  const useRounded = opts.rounded !== false;
+  const roundF = useRounded ? round4 : (x: number): number => x;
+  const base = useRounded ? round2(curveValue(fit.a, fit.b, t.tvl)) : curveValue(fit.a, fit.b, t.tvl);
+  const cat = opts.category === false ? 1 : roundF(factors.get(t.category)?.factor ?? 1);
+  let v = base * cat;
+  if (opts.momentum !== false) v *= roundF(momentumFactor(t.ch, opts.momCoef ?? 0.4));
+  if (opts.seasoning !== false) v *= roundF(seasoningFactor(ageDays(asOf, t.listed), 0.8, opts.seaSpan ?? 0.2));
+  if (opts.sibling !== false && words.has(firstWord(t.name))) v *= 0.5;
+  if (opts.chain && chainFac) {
+    const ch0 = t.chains.length > 0 ? t.chains[0] : "none";
+    v *= roundF(chainFac.get(ch0)?.factor ?? 1);
   }
-  return { full: summarizeMisses(full), curveOnly: summarizeMisses(curveOnly), flat: summarizeMisses(flat) };
+  return Math.max(1, v);
 }
 
-/** The ablation table: the full model against each layer removed. */
-export function strictAblation(kept: Token[], asOf: string): Ablation {
-  const full = looFull(kept, asOf, {});
-  const noMomentum = looFull(kept, asOf, { momentum: false });
-  const noCategory = looFull(kept, asOf, { category: false });
-  const curveOnly = looFull(kept, asOf, { momentum: false, category: false, seasoning: false, sibling: false });
-  return {
-    full: full.full,
-    noMomentum: noMomentum.full,
-    noCategory: noCategory.full,
-    curveOnly: curveOnly.full,
-    flat: full.flat,
-  };
+function fitFor(comps: Comp[]): { a: number; b: number } {
+  return ols(comps.map((t) => [Math.log10(t.tvl), Math.log10(t.mcap)] as [number, number]));
 }
 
-/**
- * One time split, strict: the curve and the factors come from the tokens
- * listed before the cutoff only. Tokens with no listing date are left out
- * of both sides — assigning them a side would be guessing.
- */
-export function strictTimeSplit(
-  kept: Token[],
-  cutoff: string,
-  asOf: string,
-  opts: PriceOptions = {},
-): SplitResult {
-  const pre = kept.filter((t) => t.listed_at !== null && t.listed_at < cutoff);
-  const post = kept.filter((t) => t.listed_at !== null && t.listed_at >= cutoff);
-  const fit = olsLine(pre.map((t) => ({ x: Math.log10(t.tvl), y: Math.log10(t.mcap) })));
-  const factors = categoryFactors(pre, fit);
-  const words = new Set(pre.map((t) => firstWord(t.name)));
-  const chainFac = opts.chain ? chainFactors(pre, fit) : undefined;
-  const flatMultiple = medianOf(pre.map((t) => t.mcap / t.tvl));
-  const full: number[] = [];
-  const curveOnly: number[] = [];
-  const flat: number[] = [];
-  for (const t of post) {
-    const base = 10 ** (fit.a + fit.b * Math.log10(t.tvl));
-    full.push(missOf(priceToken(t, fit, factors, words, asOf, opts, chainFac), t.mcap));
-    curveOnly.push(missOf(base, t.mcap));
-    flat.push(missOf(t.tvl * flatMultiple, t.mcap));
-  }
-  return { cutoff, pre: pre.length, post: post.length, full: summarizeMisses(full), curveOnly: summarizeMisses(curveOnly), flat: summarizeMisses(flat) };
-}
-
-function scoreTokens(
-  tokens: Token[],
-  fit: { a: number; b: number },
-  factors: Record<string, CatFactor>,
-  words: Set<string>,
-  asOf: string,
-  opts: PriceOptions = {},
-): number[] {
-  return tokens.map((t) => missOf(priceToken(t, fit, factors, words, asOf, opts), t.mcap));
-}
-
-/** The 2024 split's newer tokens, cut by how long they had been tracked. */
-export function strictAgeSplit(kept: Token[], split: SplitResult, asOf: string): AgeSplit {
-  const post = kept.filter((t) => t.listed_at !== null && t.listed_at >= split.cutoff);
-  const pre = kept.filter((t) => t.listed_at !== null && t.listed_at < split.cutoff);
-  const fit = olsLine(pre.map((t) => ({ x: Math.log10(t.tvl), y: Math.log10(t.mcap) })));
-  const factors = categoryFactors(pre, fit);
-  const words = new Set(pre.map((t) => firstWord(t.name)));
-  const threshold = TUNE.ageSplitMonths * 30;
-  const young = post.filter((t) => (ageInDays(asOf, t.listed_at) ?? 0) < threshold);
-  const old = post.filter((t) => (ageInDays(asOf, t.listed_at) ?? 0) >= threshold);
-  return {
-    months: TUNE.ageSplitMonths,
-    young: summarizeMisses(scoreTokens(young, fit, factors, words, asOf)),
-    old: summarizeMisses(scoreTokens(old, fit, factors, words, asOf)),
-  };
-}
-
-/** Regress the curve-only residuals on one driver: slope, t-stat, correlation. */
-export function slopeCheck(kept: Token[], fit: { a: number; b: number }, driver: (t: Token) => number): SlopeCheck {
-  const xs = kept.map(driver);
-  const ys = kept.map((t) => curveResidual(t, fit));
-  const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
-  const my = ys.reduce((a, b) => a + b, 0) / ys.length;
-  let sxy = 0;
-  let sxx = 0;
-  let syy = 0;
-  for (let i = 0; i < xs.length; i++) {
-    sxy += (xs[i]! - mx) * (ys[i]! - my);
-    sxx += (xs[i]! - mx) ** 2;
-    syy += (ys[i]! - my) ** 2;
-  }
-  const slope = sxx === 0 ? 0 : sxy / sxx;
-  const r = sxx === 0 || syy === 0 ? 0 : sxy / Math.sqrt(sxx * syy);
-  const residVar = syy === 0 ? 0 : (syy - slope * sxy) / Math.max(1, xs.length - 2);
-  const se = sxx === 0 ? 0 : Math.sqrt(residVar / sxx);
-  return { slope: round4(slope), t: round2(se === 0 ? 0 : slope / se), r: round4(r) };
-}
-
-export function residualQuantiles(
-  kept: Token[],
-  fit: { a: number; b: number },
-  factors: Record<string, CatFactor>,
-  asOf: string,
-): Validation['quantiles'] {
-  // Full-model residuals: log10(actual cap) minus log10(the model's own
-  // price for that token — curve + category + momentum + seasoning +
-  // sibling). Nearest-rank (type-1 / inverted_cdf): the k-th smallest
-  // residual with k = ceil(p * n).
-  // The sibling set for pricing a token is the first words of the OTHER
-  // kept comparables — a token is only a sibling when a DIFFERENT traded
-  // token shares its first word. Building the set from the other tokens,
-  // rather than deleting the word from the full set, keeps that
-  // distinction: deleting "yield" would also erase Yield Basis.
-  const sorted = kept
-    .map((t) => {
-      const age = ageInDays(asOf, t.listed_at);
-      const words = new Set(kept.filter((o) => o !== t).map((o) => firstWord(o.name)));
-      const parts = priceProtocol(t.tvl, t.change_7d ?? 0, age, t.name, t.category, t.chains, fit, factors, words);
-      return Math.log10(t.mcap) - Math.log10(parts.value);
-    })
-    .sort((a, b) => a - b);
-  const at = (p: number): number => {
-    const k = Math.max(1, Math.ceil(p * sorted.length));
-    return round4(sorted[Math.min(k, sorted.length) - 1]!);
-  };
-  return { p10: at(0.1), p25: at(0.25), p50: at(0.5), p75: at(0.75), p90: at(0.9) };
-}
-
-// ------------------------------------------------------------------ ridge cross-check
-
-/**
- * A second, jointly-fitted model: one ridge on log10(mcap/TVL) with a size
- * slope and one dummy per category (categories with at least 2 tokens).
- * It is a cross-check, not the model: it is reported beside the sequential
- * one with its own strict leave-one-out, and it does not set any price.
- */
-export function ridgeCrossCheck(kept: Token[]): RidgeCheck {
-  const cats = [...new Set(kept.map((t) => t.category))].filter((c) => kept.filter((t) => t.category === c).length >= 2).sort();
-  const lambda = TUNE.ridgeLambda;
+// Leave-one-out over the kept comps: each comp is priced by a model that
+// never saw it — fresh curve, fresh category factors, fresh sibling words.
+// The flat baseline is different: one market multiple for the whole board,
+// the median mcap/TVL across all kept comps, not a per-fold refit.
+export function looSummary(kept: Comp[], opts: PriceOpts, asOf: string): BlindSummary {
   const misses: number[] = [];
-  const curveMisses: number[] = [];
+  const flatMult = medianMultiple(kept);
   for (let i = 0; i < kept.length; i++) {
-    const held = kept[i]!;
-    const rest = kept.filter((_, j) => j !== i);
-    const mean = rest.map((t) => Math.log10(t.tvl)).reduce((a, b) => a + b, 0) / rest.length;
-    const sd = popSd(rest.map((t) => Math.log10(t.tvl))) || 1;
-    const build = (t: Token): number[] => {
-      const z = (Math.log10(t.tvl) - mean) / sd;
-      const row = [1, z];
-      for (const c of cats) row.push(t.category === c ? 1 : 0);
-      return row;
-    };
-    const x = rest.map(build);
-    const y = rest.map((t) => Math.log10(t.mcap / t.tvl));
-    const p = 2 + cats.length;
-    const ata: number[][] = Array.from({ length: p }, () => new Array<number>(p).fill(0));
-    const atb: number[] = new Array<number>(p).fill(0);
-    for (let r = 0; r < x.length; r++) {
-      for (let a = 0; a < p; a++) {
-        atb[a] = atb[a]! + x[r]![a]! * y[r]!;
-        for (let b = 0; b < p; b++) ata[a]![b] = ata[a]![b]! + x[r]![a]! * x[r]![b]!;
-      }
+    const train = kept.filter((_, j) => j !== i);
+    const f = fitFor(train);
+    const fac = categoryFactors(train, f);
+    const words = siblingWords(train);
+    const chainFac = opts.chain ? chainFactors(train, f) : undefined;
+    const t = kept[i];
+    let price: number;
+    if (opts.flat === true) {
+      price = t.tvl * flatMult;
+    } else {
+      price = priceBlind(t, f, fac, words, opts, asOf, chainFac);
     }
-    for (let a = 2; a < p; a++) ata[a]![a] = ata[a]![a]! + lambda;
-    const beta = solveLinear(ata, atb);
-    const pred = held.tvl * 10 ** (build(held).reduce((s, v, k) => s + v * beta[k]!, 0));
-    misses.push(missOf(pred, held.mcap));
-    const fit = olsLine(rest.map((t) => ({ x: Math.log10(t.tvl), y: Math.log10(t.mcap) })));
-    curveMisses.push(missOf(10 ** (fit.a + fit.b * Math.log10(held.tvl)), held.mcap));
+    misses.push(missRatio(price, t.mcap));
   }
-  const s = summarizeMisses(misses);
-  const c = summarizeMisses(curveMisses);
-  return { lambda, n: kept.length, medianMiss: s.medianMiss, within3: s.within3, curveOnlyMiss: c.medianMiss };
+  return summarizeMisses(misses);
 }
 
-// ------------------------------------------------------------------ bootstrap
+export type SplitResult = {
+  cutoff: string;
+  pre: number;
+  post: number;
+  full: BlindSummary;
+  curveOnly: BlindSummary;
+  flat: BlindSummary;
+};
 
-/**
- * 200 refits on resampled comparables: each refit reprices every board
- * row, and the P10–P90 of the ranks (and values) is the row's range. The
- * resampling is seeded, so the ranges are stable across rebuilds.
- */
-export function bootstrapRanges(
-  kept: Token[],
-  rows: { slug: string; tvl: number; change_7d: number; age: number | null; name: string; category: string; chains: string[] }[],
-  refits: number,
-): Map<string, { rankLo: number; rankHi: number; p10: number; p90: number }> {
-  const rng = mulberry32(20261114);
-  const rankLists = new Map<string, number[]>();
-  const valueLists = new Map<string, number[]>();
-  for (const r of rows) {
-    rankLists.set(r.slug, []);
-    valueLists.set(r.slug, []);
-  }
-  for (let k = 0; k < refits; k++) {
-    const sample: Token[] = [];
-    for (let i = 0; i < kept.length; i++) sample.push(kept[Math.floor(rng() * kept.length)]!);
-    const fit = olsLine(sample.map((t) => ({ x: Math.log10(t.tvl), y: Math.log10(t.mcap) })));
-    const factors = categoryFactors(sample, fit);
-    const words = new Set(sample.map((t) => firstWord(t.name)));
-    const priced = rows
-      .map((r) => ({
-        slug: r.slug,
-        value: priceProtocol(r.tvl, r.change_7d, r.age, r.name, r.category, r.chains, fit, factors, words).value,
-      }))
-      .sort((a, b) => b.value - a.value);
-    priced.forEach((p, idx) => {
-      rankLists.get(p.slug)!.push(idx + 1);
-      valueLists.get(p.slug)!.push(p.value);
-    });
-  }
-  const out = new Map<string, { rankLo: number; rankHi: number; p10: number; p90: number }>();
-  for (const r of rows) {
-    const ranks = [...rankLists.get(r.slug)!].sort((a, b) => a - b);
-    const vals = [...valueLists.get(r.slug)!].sort((a, b) => a - b);
-    out.set(r.slug, {
-      rankLo: Math.round(quantileOf(ranks, 0.1)),
-      rankHi: Math.round(quantileOf(ranks, 0.9)),
-      p10: Math.round(quantileOf(vals, 0.1)),
-      p90: Math.round(quantileOf(vals, 0.9)),
-    });
-  }
-  return out;
+// Time split: train on everything listed before the cutoff, price what
+// listed after it. The curve never sees the future. The `full` column
+// honours the option set, so the term-selection table can re-run the split
+// under each candidate model.
+export function splitSummary(kept: Comp[], cutoff: string, opts: PriceOpts, asOf: string): SplitResult {
+  const pre = kept.filter((t) => t.listed !== null && t.listed < cutoff);
+  const post = kept.filter((t) => t.listed !== null && t.listed >= cutoff);
+  const f = fitFor(pre);
+  const fac = categoryFactors(pre, f);
+  const words = siblingWords(pre);
+  const flatMult = medianMultiple(pre);
+  const chainFac = opts.chain ? chainFactors(pre, f) : undefined;
+  const priceOf = (t: Comp, o: PriceOpts): number => priceBlind(t, f, fac, words, o, asOf, chainFac);
+  const curveOpts: PriceOpts = { category: false, momentum: false, seasoning: false, sibling: false };
+  return {
+    cutoff,
+    pre: pre.length,
+    post: post.length,
+    full: summarizeMisses(post.map((t) => missRatio(priceOf(t, opts), t.mcap))),
+    curveOnly: summarizeMisses(post.map((t) => missRatio(priceOf(t, curveOpts), t.mcap))),
+    flat: summarizeMisses(post.map((t) => missRatio(t.tvl * flatMult, t.mcap))),
+  };
 }
 
-// ------------------------------------------------------------------ walk-forward
+export type WalkForwardResult = {
+  folds: FoldResult[];
+  overall: BlindSummary;
+  overallCurve: BlindSummary;
+  earlyOverall: BlindSummary;
+  earlyCurve: BlindSummary;
+};
 
-/**
- * Walk-forward, strict: the comparables are ordered by listing date; for
- * each yearly boundary the curve and the factors are fitted on the tokens
- * listed before the boundary and scored on the NEXT year's cohort only.
- * The last fold has only 8 tokens and is reported on its own — the pooled
- * overall is given with and without it.
- */
-export function walkForward(kept: Token[], asOf: string, opts: PriceOptions = {}): WalkForward {
-  const dated = kept.filter((t) => t.listed_at !== null);
-  const bounds = TUNE.walkBounds;
-  const folds: WalkFold[] = [];
+// Walk-forward: for each year, train on everything listed before January
+// 1st of that year and price what listed during it. The overall pools all
+// four folds; the early overall drops the thin 2026 fold.
+export function walkForwardSummary(kept: Comp[], opts: PriceOpts, asOf: string): WalkForwardResult {
+  const dated = kept.filter((t) => t.listed !== null);
+  const curveOpts: PriceOpts = { category: false, momentum: false, seasoning: false, sibling: false };
+  const folds: FoldResult[] = [];
   const allFull: number[] = [];
   const allCurve: number[] = [];
   const earlyFull: number[] = [];
   const earlyCurve: number[] = [];
-  for (let i = 0; i < bounds.length; i++) {
-    const b = bounds[i]!;
-    const next = i + 1 < bounds.length ? bounds[i + 1]! : '9999-12-31';
-    const pre = dated.filter((t) => t.listed_at! < b);
-    const post = dated.filter((t) => t.listed_at! >= b && t.listed_at! < next);
-    if (pre.length < 15 || post.length < 5) continue;
-    const fit = olsLine(pre.map((t) => ({ x: Math.log10(t.tvl), y: Math.log10(t.mcap) })));
-    const factors = categoryFactors(pre, fit);
-    const words = new Set(pre.map((t) => firstWord(t.name)));
-    const chainFac = opts.chain ? chainFactors(pre, fit) : undefined;
-    const full: number[] = [];
-    const curve: number[] = [];
-    for (const t of post) {
-      const base = 10 ** (fit.a + fit.b * Math.log10(t.tvl));
-      full.push(missOf(priceToken(t, fit, factors, words, asOf, opts, chainFac), t.mcap));
-      curve.push(missOf(base, t.mcap));
-    }
-    folds.push({ boundary: b, train: pre.length, test: post.length, full: summarizeMisses(full), curveOnly: summarizeMisses(curve) });
-    allFull.push(...full);
-    allCurve.push(...curve);
-    if (i < bounds.length - 1) {
-      earlyFull.push(...full);
-      earlyCurve.push(...curve);
-    }
+  for (const year of [2023, 2024, 2025, 2026]) {
+    const bound = `${year}-01-01`;
+    const train = dated.filter((t) => (t.listed as string) < bound);
+    const test = dated.filter((t) => (t.listed as string).startsWith(String(year)));
+    const f = fitFor(train);
+    const fac = categoryFactors(train, f);
+    const words = siblingWords(train);
+    const chainFac = opts.chain ? chainFactors(train, f) : undefined;
+    const fullM = test.map((t) => missRatio(priceBlind(t, f, fac, words, opts, asOf, chainFac), t.mcap));
+    const curveM = test.map((t) => missRatio(priceBlind(t, f, fac, words, curveOpts, asOf, chainFac), t.mcap));
+    folds.push({
+      boundary: bound, train: train.length, test: test.length,
+      full: summarizeMisses(fullM), curveOnly: summarizeMisses(curveM),
+    });
+    allFull.push(...fullM);
+    allCurve.push(...curveM);
+    if (year < 2026) { earlyFull.push(...fullM); earlyCurve.push(...curveM); }
   }
   return {
     folds,
@@ -1137,509 +366,543 @@ export function walkForward(kept: Token[], asOf: string, opts: PriceOptions = {}
   };
 }
 
-// ------------------------------------------------------------------ term selection
+// ---- ridge on the tilts -------------------------------------------------
+// The curve alone leaves residuals. A small ridge regression (lambda 10)
+// on those residuals, using the two weak signals the t-tests measured —
+// 7-day growth and log age, both standardised — asks whether a continuous
+// tilt beats the on/off tilts. It does not: the median miss stays near
+// the curve's, so the ridge is reported and not adopted.
+type RidgeFit = { meanY: number; meanX: [number, number]; sdX: [number, number]; beta: [number, number] };
 
-interface VariantSpec {
-  term: string;
-  opts: PriceOptions;
-  verdict: string;
-  /** Rebuild the kept set from the full comp list (dedup / exclusion / trim). */
-  rebuild?: (all: Token[]) => Token[];
+function ridgeFit(xs: Array<[number, number]>, ys: number[], lambda: number): RidgeFit {
+  const n = xs.length;
+  const meanY = ys.reduce((s, v) => s + v, 0) / Math.max(1, n);
+  const meanX: [number, number] = [0, 0];
+  const sdX: [number, number] = [0, 0];
+  for (let j = 0; j < 2; j++) {
+    meanX[j] = xs.reduce((s, x) => s + x[j], 0) / Math.max(1, n);
+    const varPop = xs.reduce((s, x) => s + (x[j] - meanX[j]) ** 2, 0) / Math.max(1, n);
+    sdX[j] = Math.sqrt(varPop) || 1;
+  }
+  const z = xs.map((x) => [(x[0] - meanX[0]) / sdX[0], (x[1] - meanX[1]) / sdX[1]] as [number, number]);
+  const yc = ys.map((y) => y - meanY);
+  let s11 = 0, s12 = 0, s22 = 0, t1 = 0, t2 = 0;
+  for (let i = 0; i < n; i++) {
+    s11 += z[i][0] * z[i][0]; s12 += z[i][0] * z[i][1]; s22 += z[i][1] * z[i][1];
+    t1 += z[i][0] * yc[i]; t2 += z[i][1] * yc[i];
+  }
+  const a11 = s11 + lambda, a22 = s22 + lambda, a12 = s12;
+  const det = a11 * a22 - a12 * a12;
+  const b1 = det === 0 ? 0 : (a22 * t1 - a12 * t2) / det;
+  const b2 = det === 0 ? 0 : (a11 * t2 - a12 * t1) / det;
+  return { meanY, meanX, sdX, beta: [b1, b2] };
 }
 
-function blindTests(
-  kept: Token[],
-  asOf: string,
-  opts: PriceOptions,
-): { loo: number; split2024: number; split2025: number; walkForward: number } {
-  const loo = looFull(kept, asOf, opts).full.medianMiss;
-  const split2024 = strictTimeSplit(kept, TUNE.split2024, asOf, opts).full.medianMiss;
-  const split2025 = strictTimeSplit(kept, TUNE.split2025, asOf, opts).full.medianMiss;
-  const wf = walkForward(kept, asOf, opts).overall.medianMiss;
-  return { loo, split2024, split2025, walkForward: wf };
+function ridgePredict(rf: RidgeFit, x: [number, number]): number {
+  return rf.meanY
+    + rf.beta[0] * ((x[0] - rf.meanX[0]) / rf.sdX[0])
+    + rf.beta[1] * ((x[1] - rf.meanX[1]) / rf.sdX[1]);
 }
 
-const EXCLUDED_COMP_CATEGORIES = new Set([
-  'Bridge',
-  'Canonical Bridge',
-  'Liquid Staking',
-  'Liquid Restaking',
-  'Restaked BTC',
-  'Cross Chain Bridge',
-]);
-
-/**
- * The term-selection table, computed live. Every row is one candidate
- * scored by the same four blind tests; the verdict is the builder's
- * judgment on those numbers (see the Method tab for the rule). The
- * baseline row is the model that prices the board.
- */
-export function termSelection(allTokens: Token[], kept: Token[], asOf: string): TermRow[] {
-  const variants: VariantSpec[] = [
-    { term: 'Full model (the board)', opts: {}, verdict: 'the model — kept' },
-    { term: 'Without momentum', opts: { momentum: false }, verdict: 'kept — leave-one-out keeps it' },
-    { term: 'Without category', opts: { category: false }, verdict: 'kept — leave-one-out keeps it' },
-    { term: 'Without seasoning', opts: { seasoning: false }, verdict: 'kept — leave-one-out keeps it' },
-    { term: 'Without sibling', opts: { sibling: false }, verdict: 'kept as a judgment — no blind test can separate it (3 board rows)' },
-    { term: 'Curve alone (no tilts)', opts: { momentum: false, category: false, seasoning: false, sibling: false }, verdict: 'not adopted — the tilts win leave-one-out' },
-    { term: 'Momentum ×0.6', opts: { momentumCoef: 0.6 }, verdict: 'not adopted — the fitted slope is too weak (t=0.74)' },
-    { term: 'Momentum ×0.2', opts: { momentumCoef: 0.2 }, verdict: 'not adopted — weaker on leave-one-out' },
-    { term: 'Seasoning span 0.1', opts: { seasoningSpan: 0.1 }, verdict: 'not adopted — wins leave-one-out only' },
-    { term: 'Seasoning span 0.3', opts: { seasoningSpan: 0.3 }, verdict: 'not adopted — the leave-one-out cost is larger than the out-of-time gain' },
-    { term: 'Chain factor added', opts: { chain: true }, verdict: 'dropped — loses on every blind test' },
-    {
-      term: 'One-per-ticker comps',
-      opts: {},
-      verdict: 'checked — no change (duplicate already trimmed)',
-      rebuild: (all) => fitTwice(dedupBySymbol(all)).kept,
-    },
-    {
-      term: 'Comps excl. Bridge / Liquid Staking',
-      opts: {},
-      verdict: 'dropped — weaker on leave-one-out and the 2024 split',
-      rebuild: (all) => fitTwice(all.filter((t) => !EXCLUDED_COMP_CATEGORIES.has(t.category))).kept,
-    },
-    {
-      term: 'Trim at 2.0 sd',
-      opts: {},
-      verdict: 'not adopted — the 1.5 sd trim wins on every test',
-      rebuild: (all) => fitTwice(all, 2.0).kept,
-    },
-  ];
-  return variants.map((v) => {
-    const set = v.rebuild ? v.rebuild(allTokens) : kept;
-    const t = blindTests(set, asOf, v.opts);
-    return { term: v.term, loo: t.loo, split2024: t.split2024, split2025: t.split2025, walkForward: t.walkForward, verdict: v.verdict };
-  });
+function ridgeFeatures(t: Comp, asOf: string): [number, number] {
+  return [t.ch / 100, Math.log10(ageDays(asOf, t.listed) ?? 365)];
 }
 
-// ------------------------------------------------------------------ farm economics
+export function ridgeSummary(kept: Comp[], asOf: string, lambda = 10): { medianMiss: number; within3: number } {
+  const misses: number[] = [];
+  for (let i = 0; i < kept.length; i++) {
+    const train = kept.filter((_, j) => j !== i);
+    const f = fitFor(train);
+    const fac = categoryFactors(train, f);
+    const t = kept[i];
+    const xs = train.map((u) => ridgeFeatures(u, asOf));
+    const ys = train.map((u) => {
+      const cat = fac.get(u.category)?.factor ?? 1;
+      return Math.log10(u.mcap) - Math.log10(curveValue(f.a, f.b, u.tvl) * cat);
+    });
+    const rf = ridgeFit(xs, ys, lambda);
+    const cat = fac.get(t.category)?.factor ?? 1;
+    const pred = curveValue(f.a, f.b, t.tvl) * cat * 10 ** ridgePredict(rf, ridgeFeatures(t, asOf));
+    misses.push(missRatio(Math.max(1, pred), t.mcap));
+  }
+  const s = summarizeMisses(misses);
+  return { medianMiss: s.medianMiss, within3: s.within3 };
+}
 
-/**
- * What one transaction costs on a chain, in dollars. These are the
- * going rates for a plain transfer-and-call at the snapshot date, not a
- * quote: Ethereum is the expensive one, the L2s and Solana are cents.
- * A chain the table does not know budgets $1 a transaction.
- */
-export const GAS_USD: Record<string, number> = {
-  ethereum: 5.5, solana: 0.03, base: 0.15, arbitrum: 0.2, optimism: 0.15, polygon: 0.1,
-  binance: 0.25, avalanche: 0.4, berachain: 0.3, sonic: 0.2, linea: 0.15, scroll: 0.15,
-  blast: 0.15, mantle: 0.15, mode: 0.1, zksync: 0.15, sui: 0.05, ripple: 0.05, tron: 1,
-  monad: 0.05, fantom: 0.2, celo: 0.1, xdai: 0.05, bitcoin: 2, 'hyperliquid l1': 0.1, plasma: 0.15,
+// ---- t-tests on the curve-only residuals --------------------------------
+
+export function tStat(xs: number[], ys: number[]): { slope: number; t: number; r: number } {
+  const n = xs.length;
+  const mx = xs.reduce((s, v) => s + v, 0) / n;
+  const my = ys.reduce((s, v) => s + v, 0) / n;
+  let sxx = 0, sxy = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    sxx += (xs[i] - mx) ** 2;
+    sxy += (xs[i] - mx) * (ys[i] - my);
+    syy += (ys[i] - my) ** 2;
+  }
+  const slope = sxx === 0 ? 0 : sxy / sxx;
+  const r = sxx === 0 || syy === 0 ? 0 : sxy / Math.sqrt(sxx * syy);
+  const intercept = my - slope * mx;
+  let ssRes = 0;
+  for (let i = 0; i < n; i++) ssRes += (ys[i] - (intercept + slope * xs[i])) ** 2;
+  const se = n <= 2 || sxx === 0 ? 0 : Math.sqrt(ssRes / (n - 2) / sxx);
+  const t = se === 0 ? 0 : slope / se;
+  return { slope: round4(slope), t: round2(t), r: round4(r) };
+}
+
+// ---- one blind run (LOO + both splits + walk-forward) -------------------
+
+export type BlindRun = {
+  loo: BlindSummary;
+  split2024: SplitResult;
+  split2025: SplitResult;
+  walkForward: WalkForwardResult;
 };
 
-export function gasFor(chain: string): number {
-  return GAS_USD[chain.toLowerCase()] ?? 1;
-}
-
-/** The cheapest of a protocol's first three chains, as the snapshot lists them. */
-export function cheapestOf(p: Proto): { chain: string; gasUsd: number } {
-  const top = p.chains.slice(0, 3);
-  if (top.length === 0) return { chain: 'its main chain', gasUsd: 1 };
-  let best = top[0]!;
-  for (const c of top) if (gasFor(c) < gasFor(best)) best = c;
-  return { chain: best, gasUsd: gasFor(best) };
-}
-
-/**
- * How long to hold: a young record needs a full quarter to qualify across
- * snapshots; an old one is closer to launch, so a shorter hold is enough.
- * No listing date: sixty days, the middle of the range.
- */
-export function holdFor(age: number | null): number {
-  if (age === null) return 60;
-  if (age < 365) return 90;
-  if (age < 730) return 60;
-  return 45;
-}
-
-/** The slice of an implied value a capital earns at an airdrop share. */
-export function sliceOf(tvl: number, implied: number, capital: number, share: number): number {
-  return (capital / (tvl + capital)) * share * implied;
-}
-
-/** The T-bill yield forgone on a capital over the hold. */
-export function tbillOf(capital: number, holdDays: number): number {
-  return capital * TUNE.tbillRate * (holdDays / 365);
-}
-
-/** One short mechanism phrase per row, from the category and the chains. */
-export function mechanismFor(p: Proto): string {
-  const c = (p.category ?? '').toLowerCase();
-  if (c.includes('curator') || c.includes('allocator')) return 'curated vault';
-  if (c.includes('rwa')) return 'yield-bearing asset';
-  if (c.includes('basis')) return 'delta-neutral basis';
-  if (c.includes('lending') || c.includes('cdp') || c.includes('collateral')) return 'lend & borrow';
-  if (c.includes('dex') || c.includes('leveraged farm')) return 'liquidity & swaps';
-  if (c.includes('yield aggregator')) return 'auto-compounding vault';
-  if (c.includes('yield')) return 'yield vault';
-  if (c.includes('prediction')) return 'markets & volume';
-  if (c.includes('perpetual') || c.includes('derivative')) return 'perps & hedges';
-  if (c.includes('restak')) return 'restaked yield';
-  if (c.includes('chain')) return 'chain activity';
-  if (c.includes('payment')) return 'payments flow';
-  if (c.includes('bridge')) return 'bridged liquidity';
-  if (c.includes('staking')) return 'staked yield';
-  if (c.includes('index')) return 'index basket';
-  return 'onchain position';
-}
-
-function coreAction(p: Proto, capital: number, chain: string): string {
-  const c = (p.category ?? '').toLowerCase();
-  const name = p.name;
-  if (c.includes('curator') || c.includes('allocator')) return `Put $${capital} of USDC into a ${name} vault on ${chain} and keep the vault shares.`;
-  if (c.includes('rwa')) return `Mint $${capital} of ${name}'s yield-bearing asset on ${chain} and hold it to the snapshot.`;
-  if (c.includes('basis')) return `Post $${capital} of USDC as margin for ${name}'s basis trade on ${chain} and leave the position open.`;
-  if (c.includes('lending') || c.includes('cdp') || c.includes('collateral')) return `Supply $${capital} of USDC to ${name} on ${chain}, borrow a small amount against it, and leave both legs open.`;
-  if (c.includes('dex') || c.includes('yield aggregator') || c.includes('leveraged farm')) return `Add $${capital} of liquidity to ${name}'s main pool on ${chain} and leave it in range.`;
-  if (c.includes('yield')) return `Deposit $${capital} of USDC into ${name}'s highest-yield vault on ${chain} and keep the shares.`;
-  if (c.includes('perpetual') || c.includes('derivative')) return `Post $${capital} of USDC as margin on ${name} and open one small hedged position.`;
-  if (c.includes('prediction')) return `Fund $${capital} on ${name} and take one market position on ${chain}.`;
-  if (c.includes('payment')) return `Route $${capital} of volume through ${name} on ${chain} and keep the receipts.`;
-  if (c.includes('chain')) return `Use ${name} for $${capital} of activity on ${chain} and keep the wallet funded.`;
-  return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
-}
-
-function weeklyAction(p: Proto, chain: string): string {
-  const c = (p.category ?? '').toLowerCase();
-  if (c.includes('curator') || c.includes('allocator')) return 'Check the vault allocation and top it up if the strategy changed.';
-  if (c.includes('rwa')) return 'Check the asset is still minting and the yield is still accruing.';
-  if (c.includes('basis')) return 'Check the funding rate and rebalance the hedge if it flipped sign.';
-  if (c.includes('lending') || c.includes('cdp') || c.includes('collateral')) return 'Check the borrow rate and the health factor, and top up collateral if it slipped.';
-  if (c.includes('dex') || c.includes('yield aggregator') || c.includes('leveraged farm')) return 'Check the pool is still in range and collect any fees into the position.';
-  if (c.includes('yield')) return 'Check the vault yield against the page and move the funds if it fell behind.';
-  if (c.includes('perpetual') || c.includes('derivative')) return 'Check the hedge is still balanced and the margin is above the minimum.';
-  if (c.includes('prediction')) return 'Settle one market and open the next one the page lists.';
-  return 'Check the points page and confirm the position still counts.';
-}
-
-function disqualifierFor(p: Proto): string {
-  const c = (p.category ?? '').toLowerCase();
-  if (c.includes('curator') || c.includes('allocator')) return 'Withdrawing before the snapshot, or holding only on a centralised exchange, can disqualify the position.';
-  if (c.includes('rwa')) return 'Selling the yield asset before the snapshot, or holding it only on a centralised exchange, can disqualify the position.';
-  if (c.includes('basis')) return 'Closing the hedge early, or running the position on a single chain the page does not list, can disqualify the position.';
-  if (c.includes('lending') || c.includes('cdp') || c.includes('collateral')) return 'Letting the health factor fall under the minimum, or repaying the borrow before the snapshot, can disqualify the position.';
-  if (c.includes('dex') || c.includes('yield aggregator') || c.includes('leveraged farm')) return 'Pulling liquidity out of range, or splitting the position across many wallets, can disqualify the position.';
-  if (c.includes('yield')) return 'Moving the funds to a different vault mid-hold, or withdrawing before the snapshot, can disqualify the position.';
-  return 'Using a fresh wallet per action, or farming from an exchange deposit address, can disqualify the position.';
-}
-
-/**
- * Eight steps per row, sized to ONE deposit of `capital` dollars: the fund
- * step moves that deposit onto the cheapest chain, the core action deposits
- * the same amount, and the upkeep and exit are costed against it. Costs:
- * fund (gas + a $1.50 bridge when the farm spans more than one chain),
- * deposit (gas), weekly upkeep (gas, once a fortnight over the hold, at
- * most six times), claim and exit (gas). The rest cost nothing but minutes.
- */
-export function farmStepsFor(p: Proto, capital: number, asOf: string): FarmStep[] {
-  const cheap = cheapestOf(p);
-  const gas = cheap.gasUsd;
-  const age = ageInDays(asOf, p.listed_at);
-  const hold = holdFor(age);
-  const upkeep = Math.min(6, Math.ceil(hold / 14));
-  // A farm that spans more than one chain pays one $1.50 bridge on top.
-  const bridge = p.chains.length > 1 ? TUNE.bridgeUsd : 0;
-  const growth = p.change_7d ?? 0;
-  const growthNote =
-    growth <= -20
-      ? ' TVL is down sharply over seven days, so size the position small and hold through at least one snapshot.'
-      : growth >= 20
-        ? ' TVL is up sharply over seven days, so open the position within 48 hours while the growth is fresh.'
-        : '';
-  const steps: FarmStep[] = [
-    { text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.${growthNote}`, costUsd: 0, minutes: 5 },
-    {
-      text: `Fund the wallet with $${capital} of USDC on ${cheap.chain}, the cheapest of ${p.name}'s top three chains — that is the deposit this plan is sized to — and keep $${(gas + bridge).toFixed(2)} aside for gas${bridge > 0 ? ` plus one $${bridge.toFixed(2)} bridge (the farm spans ${p.chains.length} chains)` : ''}; check the balance before you deposit.`,
-      costUsd: round2(gas + bridge),
-      minutes: 10,
+function runBlind(
+  comps: Comp[], opts: PriceOpts, trimSd: number, asOf: string,
+): { kept: Comp[]; fit: { a: number; b: number; n: number; r2: number }; run: BlindRun } {
+  const { kept, fit } = fitAndTrim(comps, trimSd);
+  return {
+    kept,
+    fit,
+    run: {
+      loo: looSummary(kept, opts, asOf),
+      split2024: splitSummary(kept, "2024-01-01", opts, asOf),
+      split2025: splitSummary(kept, "2025-01-01", opts, asOf),
+      walkForward: walkForwardSummary(kept, opts, asOf),
     },
-    { text: coreAction(p, capital, cheap.chain), costUsd: round2(gas), minutes: 15 },
-    { text: `${weeklyAction(p, cheap.chain)} Do it ${upkeep} times over the hold so the position is not a one-off.`, costUsd: round2(upkeep * gas), minutes: 10 * upkeep },
-    { text: `Hold the position for at least ${hold} days and watch one risk trigger: if TVL falls 20% in a week, or the vault's allocation changes without notice, shrink the position before the next snapshot.`, costUsd: 0, minutes: 10 },
-    { text: disqualifierFor(p), costUsd: 0, minutes: 10 },
-    { text: `When the position has been counted, claim the rewards and exit the position in one transaction on ${cheap.chain}; leave a little gas in the wallet so the exit cannot strand the funds.`, costUsd: round2(gas), minutes: 15 },
-    { text: `Write down what the farm returned against the plan on this page, so the next protocol starts from a real number, not a guess.`, costUsd: 0, minutes: 5 },
+  };
+}
+
+// ---- term selection -----------------------------------------------------
+// Fourteen ways the model could have been built. Each one is re-run blind
+// and judged on the same four numbers; the table is the evidence for
+// keeping the model as it is.
+
+const TERM_VERDICTS = {
+  full: "the model, kept as-is",
+  noMomentum: "kept: leave-one-out still prefers it",
+  noCategory: "kept: leave-one-out still prefers it",
+  noSeasoning: "kept: leave-one-out still prefers it",
+  noSibling: "kept on judgement — no blind test can separate it (3 board rows)",
+  curveOnly: "not adopted — the tilts win on leave-one-out",
+  mom06: "not adopted — the fitted slope is too weak (t = 0.74)",
+  mom02: "not adopted — weaker on leave-one-out",
+  sea01: "not adopted — wins on leave-one-out only",
+  sea03: "not adopted — the leave-one-out cost outweighs the out-of-time gain",
+  chain: "dropped — worse on every blind test",
+  onePerTicker: "checked — no change, the duplicate is already trimmed",
+  exclCats: "dropped — worse on leave-one-out and the 2024 split",
+  trim20: "not adopted — the 1.5 sd trim wins on every test",
+};
+
+export function termSelection(allComps: Comp[], asOf: string): TermRow[] {
+  const curveOpts: PriceOpts = { category: false, momentum: false, seasoning: false, sibling: false };
+  const variants: Array<{
+    term: string; opts: PriceOpts; verdict: string;
+    comps?: Comp[]; trimSd?: number;
+  }> = [
+    { term: "Full model (the board)", opts: {}, verdict: TERM_VERDICTS.full },
+    { term: "No momentum", opts: { momentum: false }, verdict: TERM_VERDICTS.noMomentum },
+    { term: "No category", opts: { category: false }, verdict: TERM_VERDICTS.noCategory },
+    { term: "No seasoning", opts: { seasoning: false }, verdict: TERM_VERDICTS.noSeasoning },
+    { term: "No sibling", opts: { sibling: false }, verdict: TERM_VERDICTS.noSibling },
+    { term: "Curve only", opts: curveOpts, verdict: TERM_VERDICTS.curveOnly },
+    { term: "Momentum ×0.6", opts: { momCoef: 0.6 }, verdict: TERM_VERDICTS.mom06 },
+    { term: "Momentum ×0.2", opts: { momCoef: 0.2 }, verdict: TERM_VERDICTS.mom02 },
+    { term: "Seasoning span 0.1", opts: { seaSpan: 0.1 }, verdict: TERM_VERDICTS.sea01 },
+    { term: "Seasoning span 0.3", opts: { seaSpan: 0.3 }, verdict: TERM_VERDICTS.sea03 },
+    { term: "Chain factor added", opts: { chain: true }, verdict: TERM_VERDICTS.chain },
+    {
+      term: "One-per-ticker comps", opts: {}, verdict: TERM_VERDICTS.onePerTicker,
+      comps: dedupeByTicker(allComps),
+    },
+    {
+      term: "Comps without Bridge / Liquid Staking", opts: {}, verdict: TERM_VERDICTS.exclCats,
+      comps: allComps.filter((t) => t.category !== "Bridge" && t.category !== "Liquid Staking"),
+    },
+    { term: "Trim at 2.0 sd", opts: {}, verdict: TERM_VERDICTS.trim20, trimSd: 2.0 },
   ];
-  for (const s of steps) {
-    if (s.text.length > 600) s.text = `${s.text.slice(0, 596)}...`;
+  return variants.map((v) => {
+    const { run } = runBlind(v.comps ?? allComps, v.opts, v.trimSd ?? TRIM_SD, asOf);
+    return {
+      term: v.term,
+      loo: run.loo.medianMiss,
+      split2024: run.split2024.full.medianMiss,
+      split2025: run.split2025.full.medianMiss,
+      walkForward: run.walkForward.overall.medianMiss,
+      verdict: v.verdict,
+    };
+  });
+}
+
+export function dedupeByTicker(comps: Comp[]): Comp[] {
+  const best = new Map<string, Comp>();
+  for (const t of comps) {
+    const cur = best.get(t.symbol);
+    if (!cur || t.tvl > cur.tvl) best.set(t.symbol, t);
   }
-  return steps;
+  return [...best.values()].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
 }
 
-function peersFor(row: Proto, tokens: Token[]): Peer[] {
-  const inCat = tokens.filter((t) => t.category === (row.category ?? 'Other'));
-  const others = tokens.filter((t) => t.category !== (row.category ?? 'Other'));
-  const byTvl = (a: Token, b: Token) => Math.abs(Math.log10(a.tvl / row.tvl_usd)) - Math.abs(Math.log10(b.tvl / row.tvl_usd));
-  const picked = [...inCat].sort(byTvl).slice(0, TUNE.peerCount);
-  if (picked.length < TUNE.peerCount) {
-    picked.push(...[...others].sort(byTvl).slice(0, TUNE.peerCount - picked.length));
+export function duplicateTickers(comps: Comp[]): string {
+  const groups = new Map<string, Comp[]>();
+  for (const t of comps) {
+    if (!t.symbol) continue;
+    const arr = groups.get(t.symbol) ?? [];
+    arr.push(t);
+    groups.set(t.symbol, arr);
   }
-  return picked.map((t) => ({ slug: t.slug, name: t.name, tvl: t.tvl, mcap: t.mcap, ratio: round4(t.mcap / t.tvl) }));
+  const out: string[] = [];
+  for (const [sym, arr] of groups) {
+    if (arr.length < 2) continue;
+    const names = [...arr].sort((a, b) => b.tvl - a.tvl).map((t) => t.name).join(", ");
+    out.push(`${sym} (${names})`);
+  }
+  return out.sort().join("; ");
 }
 
-function sensitivityFor(tvl: number, fees: number, hold: number, implied: number): BoardRow['sensitivity'] {
-  const drops = [0.05, 0.1, 0.2];
-  const capitals = [1000, 10000, 100000];
-  const net = drops.map((d) =>
-    capitals.map((cap) => round2(sliceOf(tvl, implied, cap, d) - fees - tbillOf(cap, hold))),
-  );
-  return { drops, capitals, net };
+// ---- board ----------------------------------------------------------------
+
+function setAsideReason(p: Proto): string | null {
+  if (NOT_A_LAUNCH.has(p.category)) return `category ${p.category} is not a launch`;
+  if (VERSION_RE.test(p.name)) return "versioned listing (V2, 2.0, …)";
+  const words = p.name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (words.some((w) => WRAPPED_WORDS.includes(w))) {
+    return "wrapped or staked product of a token that trades";
+  }
+  for (const ex of EXCHANGE_NAMES) {
+    if (p.name.startsWith(ex)) return `${ex} listing, not a protocol launch`;
+  }
+  return null;
 }
 
-/**
- * Break-even odds: the chance the farm nets positive, from the row's own
- * band. The band is lognormal with σ from its P10–P90 width; the break-even
- * value is the implied value at which the slice exactly covers fees plus
- * the T-bill forgone.
- */
-export function breakEvenOdds(implied: number, p10: number, p90: number, tvl: number, fees: number, tbill: number): number {
-  const sigma = (Math.log10(p90) - Math.log10(p10)) / (2 * 1.2816);
-  if (!(sigma > 0)) return implied > 0 ? 0.5 : 0;
-  const breakEven = ((fees + tbill) * (tvl + TUNE.capitalUsd)) / (TUNE.capitalUsd * TUNE.airdropShare);
-  if (breakEven <= 0) return 1;
-  return round4(normCdf((Math.log10(implied) - Math.log10(breakEven)) / sigma));
+function residualQuantiles(
+  kept: Comp[], fit: { a: number; b: number },
+  factors: Map<string, FactorInfo>, asOf: string,
+): { exact: { p10: number; p25: number; p50: number; p75: number; p90: number };
+     rounded: { p10: number; p25: number; p50: number; p75: number; p90: number } } {
+  const res: number[] = [];
+  for (let i = 0; i < kept.length; i++) {
+    const others = kept.filter((_, j) => j !== i);
+    const words = siblingWords(others);
+    const t = kept[i];
+    const price = priceBlind(t, fit, factors, words, { rounded: false }, asOf);
+    res.push(Math.log10(t.mcap) - Math.log10(price));
+  }
+  const s = [...res].sort((a, b) => a - b);
+  const exact = {
+    p10: quantile1(s, 0.1), p25: quantile1(s, 0.25), p50: quantile1(s, 0.5),
+    p75: quantile1(s, 0.75), p90: quantile1(s, 0.9),
+  };
+  const rounded = {
+    p10: round4(exact.p10), p25: round4(exact.p25), p50: round4(exact.p50),
+    p75: round4(exact.p75), p90: round4(exact.p90),
+  };
+  return { exact, rounded };
 }
 
-// ------------------------------------------------------------------ the board
+// Age split on the 2024 time split: the protocols that listed after the
+// cutoff, cut at 18 months. Young listings price worse than old ones.
+function ageSplitSummary(kept: Comp[], asOf: string): { months: number; young: BlindSummary; old: BlindSummary } {
+  const pre = kept.filter((t) => t.listed !== null && t.listed < "2024-01-01");
+  const post = kept.filter((t) => t.listed !== null && t.listed >= "2024-01-01");
+  const f = fitFor(pre);
+  const fac = categoryFactors(pre, f);
+  const words = siblingWords(pre);
+  const priceOf = (t: Comp): number => priceBlind(t, f, fac, words, {}, asOf);
+  const young = post.filter((t) => (ageDays(asOf, t.listed) ?? 0) < 540);
+  const old = post.filter((t) => (ageDays(asOf, t.listed) ?? 0) >= 540);
+  return {
+    months: 18,
+    young: summarizeMisses(young.map((t) => missRatio(priceOf(t), t.mcap))),
+    old: summarizeMisses(old.map((t) => missRatio(priceOf(t), t.mcap))),
+  };
+}
 
-export function buildRadar(snap: Snap): RadarData {
-  const asOf = snap.as_of || '2026-11-14';
-  const compSet = collectTokens(snap);
-  const tokens = compSet.tokens;
-  const { first, firstSd, kept, outliers, fit } = fitTwice(tokens);
+type RowCore = {
+  proto: Proto;
+  age: number | null;
+  hold: number;
+  checks: number;
+  chain: string;
+  gas: number;
+  multiChain: boolean;
+  mechanism: string;
+  curveR: number;
+  catR: number;
+  catN: number;
+  catSrc: string;
+  momR: number;
+  seaR: number;
+  sib: number;
+  implied: number;
+  p10: number;
+  p25: number;
+  p75: number;
+  p90: number;
+  low: number;
+  slice: number;
+  sliceLow: number;
+  fees: number;
+  tbill: number;
+  net: number;
+  netLow: number;
+  hours: number;
+  perHour: number;
+  perHourLow: number;
+  odds: number;
+  verdict: string;
+  minutes: number[];
+  costs: number[];
+  sensitivity: { drops: number[]; capitals: number[]; net: number[][] };
+  peers: Peer[];
+  steps: string[];
+};
+
+function buildCore(
+  p: Proto, asOf: string, fit: { a: number; b: number },
+  factors: Map<string, FactorInfo>, words: Set<string>,
+  qExact: { p10: number; p90: number }, qRound: { p10: number; p25: number; p75: number; p90: number },
+  allComps: Comp[],
+): RowCore {
+  const age = ageDays(asOf, p.listed_at);
+  const hold = holdDaysFor(age);
+  const checks = checkCountFor(hold);
+  const { chain, gas } = cheapestOf(p.chains);
+  const multiChain = p.chains.length > 1;
+  const mechanism = mechanismFor(p.category);
+  const catInfo = factors.get(p.category);
+  const catR = round4(catInfo?.factor ?? 1);
+  const catN = catInfo?.n ?? 0;
+  const catSrc = categorySource(catN);
+  const curveR = round2(curveValue(fit.a, fit.b, p.tvl_usd));
+  const momR = round4(momentumFactor(p.change_7d ?? 0, 0.4));
+  const seaR = round4(seasoningFactor(age, 0.8, 0.2));
+  const sib = words.has(firstWord(p.name)) ? 0.5 : 1;
+  // The stored value is built from the ROUNDED factors, not the raw
+  // product — that rounding is what the dashboard recomputes.
+  const implied = Math.round(curveR * catR * momR * seaR * sib);
+  const p10 = Math.round(implied * 10 ** qRound.p10);
+  const p25 = Math.round(implied * 10 ** qRound.p25);
+  const p75 = Math.round(implied * 10 ** qRound.p75);
+  const p90 = Math.round(implied * 10 ** qRound.p90);
+  const low = p25;
+  const minutes = farmMinutesFor(hold);
+  const costs = farmCostsFor(gas, multiChain, hold);
+  const fees = round2(costs.reduce((s, v) => s + v, 0));
+  const tbill = tbillFor(DEPOSIT, hold);
+  const slice = sliceFor(DEPOSIT, p.tvl_usd, implied);
+  const sliceLow = sliceFor(DEPOSIT, p.tvl_usd, low);
+  const net = round2(slice - fees - tbill);
+  const netLow = round2(sliceLow - fees - tbill);
+  const hours = round2(minutes.reduce((s, v) => s + v, 0) / 60);
+  const perHour = round2(net / hours);
+  const perHourLow = round2(netLow / hours);
+  const odds = oddsFor(implied, implied * 10 ** qExact.p10, implied * 10 ** qExact.p90, fees, tbill, p.tvl_usd);
+  const verdict = verdictFor(netLow, sliceLow, fees);
+  return {
+    proto: p, age, hold, checks, chain, gas, multiChain, mechanism,
+    curveR, catR, catN, catSrc, momR, seaR, sib,
+    implied, p10, p25, p75, p90, low,
+    slice, sliceLow, fees, tbill, net, netLow, hours, perHour, perHourLow,
+    odds, verdict, minutes, costs,
+    sensitivity: sensitivityFor(implied, p.tvl_usd, fees, hold),
+    peers: nearestPeers({ category: p.category, tvl_usd: p.tvl_usd }, allComps),
+    steps: farmStepsFor(
+      { name: p.name, chain, hold, checks, step2Cost: costs[1], multiChain, chainCount: p.chains.length, change7d: p.change_7d },
+      mechanism,
+    ),
+  };
+}
+
+// Bootstrap rank ranges: resample the kept comps with replacement, refit,
+// reprice every row, re-rank. The 10th–90th percentile of a row's rank
+// across 200 refits is its range. Seeded, so it never moves between runs.
+function bootstrapRanges(
+  cores: RowCore[], kept: Comp[], asOf: string, seed: number, refits = 200,
+): Map<string, { lo: number; hi: number }> {
+  const rng = mulberry32(seed);
+  const ranks = new Map<string, number[]>();
+  for (const c of cores) ranks.set(c.proto.slug, []);
+  for (let it = 0; it < refits; it++) {
+    const sample: Comp[] = [];
+    for (let i = 0; i < kept.length; i++) sample.push(kept[Math.floor(rng() * kept.length)]);
+    const fB = fitFor(sample);
+    const facB = categoryFactors(sample, fB);
+    const wordsB = siblingWords(sample);
+    const priced = cores.map((c) => {
+      const p = c.proto;
+      let v = curveValue(fB.a, fB.b, p.tvl_usd) * (facB.get(p.category)?.factor ?? 1);
+      v *= momentumFactor(p.change_7d ?? 0, 0.4);
+      v *= seasoningFactor(c.age, 0.8, 0.2);
+      if (wordsB.has(firstWord(p.name))) v *= 0.5;
+      return { slug: p.slug, v: Math.max(1, v) };
+    });
+    priced.sort((a, b) => b.v - a.v || (a.slug < b.slug ? -1 : 1));
+    priced.forEach((row, idx) => ranks.get(row.slug)!.push(idx + 1));
+  }
+  const out = new Map<string, { lo: number; hi: number }>();
+  for (const [slug, rs] of ranks) {
+    const s = [...rs].sort((a, b) => a - b);
+    out.set(slug, { lo: quantile1(s, 0.1), hi: quantile1(s, 0.9) });
+  }
+  return out;
+}
+
+export function buildRadar(snap: Snapshot, seed = 34038550): Radar {
+  const asOf = snap.as_of;
+  const allComps = buildComps(snap.protocols);
+  const { firstA, firstB, firstSd, fit, kept, outliers } = fitAndTrim(allComps, TRIM_SD);
   const factors = categoryFactors(kept, fit);
-  // The sibling words are the KEPT comparables' first words only — an
-  // outlier's word (e.g. Kava Lend, one of the 16 set aside) does not make
-  // a board row a sibling.
-  const tradedWords = new Set(kept.map((t) => firstWord(t.name)));
-  const quantiles = residualQuantiles(kept, fit, factors, asOf);
+  const words = siblingWords(kept);
+  const { exact: qExact, rounded: qRound } = residualQuantiles(kept, fit, factors, asOf);
+  const marketChange7d = round4(medianOf(allComps.map((t) => t.ch)));
 
-  // Strict validation, all computed live under the strict protocol.
-  const loo = strictAblation(kept, asOf);
-  const split2024 = strictTimeSplit(kept, TUNE.split2024, asOf);
-  const split2025 = strictTimeSplit(kept, TUNE.split2025, asOf);
-  const ageSplit = strictAgeSplit(kept, split2024, asOf);
-  const growthSlope = slopeCheck(kept, fit, (t) => clampNum(t.change_7d, -60, 120) / 100);
-  const ageSlope = slopeCheck(kept, fit, (t) => Math.log10(ageInDays(asOf, t.listed_at) ?? TUNE.unknownAgeDays));
-  const ridge = ridgeCrossCheck(kept);
-  const wf = walkForward(kept, asOf);
-  const terms = termSelection(tokens, kept, asOf);
-  const marketChange = medianOf(tokens.map((t) => t.change_7d));
+  const categories: Record<string, { n: number; factor: number; medianResidual: number }> = {};
+  for (const [cat, info] of factors) {
+    categories[cat] = { n: info.n, factor: round4(info.factor), medianResidual: round4(info.medianResidual) };
+  }
 
-  // One-per-ticker: the kept set already carries one observation per
-  // ticker when no duplicate symbol survives the trim.
-  const keptSymbols = kept.map((t) => t.symbol).filter((s) => s.length > 0);
-  const keptDistinct = new Set(keptSymbols).size;
-  const dupInKept = compSet.duplicateSymbols.filter((d) => kept.filter((t) => t.symbol === d.symbol).length > 1);
-  const dupText = compSet.duplicateSymbols.map((d) => `${d.symbol.toUpperCase()} (${d.names.join(', ')})`).join('; ') || 'none';
+  const curveOpts: PriceOpts = { category: false, momentum: false, seasoning: false, sibling: false };
+  const loo = {
+    full: looSummary(kept, {}, asOf),
+    noMomentum: looSummary(kept, { momentum: false }, asOf),
+    noCategory: looSummary(kept, { category: false }, asOf),
+    curveOnly: looSummary(kept, curveOpts, asOf),
+    flat: looSummary(kept, { flat: true }, asOf),
+  };
+  const split2024 = splitSummary(kept, "2024-01-01", {}, asOf);
+  const split2025 = splitSummary(kept, "2025-01-01", {}, asOf);
+  const ageSplit = ageSplitSummary(kept, asOf);
+  const curveRes = kept.map((t) => Math.log10(t.mcap) - (fit.a + fit.b * Math.log10(t.tvl)));
+  const growthSlope = tStat(kept.map((t) => t.ch / 100), curveRes);
+  const ageSlope = tStat(kept.map((t) => Math.log10(ageDays(asOf, t.listed) ?? 365)), curveRes);
+  const ridge = ridgeSummary(kept, asOf);
+  const walkForward = walkForwardSummary(kept, {}, asOf);
+  const terms = termSelection(allComps, asOf);
   const onePerTicker = {
-    duplicates: dupText,
-    keptDistinct,
-    note:
-      dupInKept.length > 0
-        ? 'duplicate tickers survive the trim — the fit carries them twice'
-        : 'the duplicate tickers are already set aside by the 1.5 sd trim, so the kept set is already one-per-ticker',
+    duplicates: duplicateTickers(allComps),
+    keptDistinct: new Set(kept.map((t) => t.symbol)).size,
+    note: "the duplicate tickers were already trimmed at 1.5 sd, so the kept set is already one-per-ticker",
   };
 
-  // The rankable board.
-  const rankable = snap.protocols.filter(isRankable);
-  const priced = rankable.map((p) => {
-    const age = ageInDays(asOf, p.listed_at);
-    const parts = priceProtocol(p.tvl_usd, p.change_7d ?? 0, age, p.name, p.category ?? 'Other', p.chains, fit, factors, tradedWords);
-    return { p, age, parts };
-  });
-  priced.sort((a, b) => b.parts.value - a.parts.value || (a.p.slug < b.p.slug ? -1 : 1));
+  const preToken = snap.protocols.filter(isPreToken);
+  const ranked: Proto[] = [];
+  const setAside: SetAside[] = [];
+  for (const p of preToken) {
+    const reason = setAsideReason(p);
+    if (reason) {
+      setAside.push({ slug: p.slug, name: p.name, category: p.category, tvl: p.tvl_usd, reason });
+    } else {
+      ranked.push(p);
+    }
+  }
+  setAside.sort((a, b) => b.tvl - a.tvl || (a.slug < b.slug ? -1 : 1));
 
-  // Bootstrap rank ranges over the priced rows.
-  const ranges = bootstrapRanges(
-    kept,
-    priced.map(({ p, age }) => ({ slug: p.slug, tvl: p.tvl_usd, change_7d: p.change_7d ?? 0, age, name: p.name, category: p.category ?? 'Other', chains: p.chains })),
-    TUNE.bootstrapRefits,
-  );
-  // How many rows move 5+ places when the tilts come off (curve-only ranks).
-  const curveOrder = [...priced].sort((a, b) => b.parts.curve - a.parts.curve || (a.p.slug < b.p.slug ? -1 : 1));
-  const curveRank = new Map(curveOrder.map((r, i) => [r.p.slug, i + 1]));
+  const cores = ranked.map((p) => buildCore(p, asOf, fit, factors, words, qExact, qRound, allComps));
+  const ranges = bootstrapRanges(cores, kept, asOf, seed);
+
+  const byImplied = [...cores].sort((a, b) => b.implied - a.implied || (a.proto.slug < b.proto.slug ? -1 : 1));
+  const rankOf = new Map<string, number>();
+  byImplied.forEach((c, i) => rankOf.set(c.proto.slug, i + 1));
+  const byCurve = [...cores].sort((a, b) => b.curveR - a.curveR || (a.proto.slug < b.proto.slug ? -1 : 1));
+  const curveRankOf = new Map<string, number>();
+  byCurve.forEach((c, i) => curveRankOf.set(c.proto.slug, i + 1));
   let tiltsMove = 0;
-  priced.forEach((r, i) => {
-    if (Math.abs(i + 1 - (curveRank.get(r.p.slug) ?? 0)) >= 5) tiltsMove++;
-  });
+  for (const c of cores) {
+    if (Math.abs((rankOf.get(c.proto.slug) ?? 0) - (curveRankOf.get(c.proto.slug) ?? 0)) >= 5) tiltsMove++;
+  }
 
-  const bandMult = (q: number): number => 10 ** q;
-  const rows: BoardRow[] = priced.map(({ p, age, parts }, i) => {
-    const steps = farmStepsFor(p, TUNE.capitalUsd, asOf);
-    const fees = round2(steps.reduce((s, x) => s + x.costUsd, 0));
-    const hold = holdFor(age);
-    const tbill = round2(tbillOf(TUNE.capitalUsd, hold));
-    const slice = round2(sliceOf(p.tvl_usd, parts.value, TUNE.capitalUsd, TUNE.airdropShare));
-    const p10 = Math.max(1, Math.round(parts.value * bandMult(quantiles.p10)));
-    const p25 = Math.max(1, Math.round(parts.value * bandMult(quantiles.p25)));
-    const p75 = Math.max(1, Math.round(parts.value * bandMult(quantiles.p75)));
-    const p90 = Math.max(1, Math.round(parts.value * bandMult(quantiles.p90)));
-    const sliceLow = round2(sliceOf(p.tvl_usd, p25, TUNE.capitalUsd, TUNE.airdropShare));
-    const net = round2(slice - fees - tbill);
-    const netLow = round2(sliceLow - fees - tbill);
-    const verdict: BoardRow['verdict'] = netLow > 0 ? 'FARM' : sliceLow > fees ? 'THIN' : 'SKIP';
-    const hours = round2(steps.reduce((s, x) => s + x.minutes, 0) / 60);
-    const range = ranges.get(p.slug) ?? { rankLo: i + 1, rankHi: i + 1, p10, p90 };
+  const rows: BoardRow[] = byImplied.map((c) => {
+    const p = c.proto;
+    const range = ranges.get(p.slug) ?? { lo: rankOf.get(p.slug) ?? 0, hi: rankOf.get(p.slug) ?? 0 };
     return {
-      slug: p.slug,
-      name: p.name,
-      category: p.category ?? 'Other',
-      mechanism: mechanismFor(p),
-      chains: p.chains,
-      tvl_usd: p.tvl_usd,
-      change_7d: p.change_7d,
-      age_days: age,
-      listed_at: p.listed_at,
-      token_status: 'pre-token',
-      rank: i + 1,
-      rank_lo: Math.min(range.rankLo, i + 1),
-      rank_hi: Math.max(range.rankHi, i + 1),
-      implied_value_usd: parts.value,
-      curve_usd: parts.curve,
-      p10_usd: p10,
-      p25_usd: p25,
-      p75_usd: p75,
-      p90_usd: p90,
-      low_usd: p25,
-      slice_usd: slice,
-      slice_low_usd: sliceLow,
-      fees_usd: fees,
-      gas_usd: cheapestOf(p).gasUsd,
-      cheapest_chain: cheapestOf(p).chain,
-      hold_days: hold,
-      tbill_usd: tbill,
-      net_usd: net,
-      net_low_usd: netLow,
-      odds: breakEvenOdds(parts.value, p10, p90, p.tvl_usd, fees, tbill),
-      per_hour_usd: round2(net / Math.max(hours, 0.25)),
-      per_hour_low_usd: round2(netLow / Math.max(hours, 0.25)),
-      hours,
-      verdict,
-      farm_steps: steps.map((s) => s.text),
-      farm_costs_usd: steps.map((s) => s.costUsd),
-      farm_minutes: steps.map((s) => s.minutes),
-      sensitivity: sensitivityFor(p.tvl_usd, fees, hold, parts.value),
-      peers: peersFor(p, tokens),
+      slug: p.slug, name: p.name, category: p.category, mechanism: c.mechanism,
+      chains: p.chains, tvl_usd: p.tvl_usd, change_7d: p.change_7d,
+      age_days: c.age, listed_at: p.listed_at, token_status: "pre-token",
+      rank: rankOf.get(p.slug) ?? 0, rank_lo: range.lo, rank_hi: range.hi,
+      implied_value_usd: c.implied, curve_usd: c.curveR,
+      p10_usd: c.p10, p25_usd: c.p25, p75_usd: c.p75, p90_usd: c.p90, low_usd: c.low,
+      slice_usd: c.slice, slice_low_usd: c.sliceLow,
+      fees_usd: c.fees, gas_usd: c.gas, cheapest_chain: c.chain,
+      hold_days: c.hold, tbill_usd: c.tbill,
+      net_usd: c.net, net_low_usd: c.netLow, odds: c.odds,
+      per_hour_usd: c.perHour, per_hour_low_usd: c.perHourLow, hours: c.hours,
+      verdict: c.verdict, farm_steps: c.steps, farm_costs_usd: c.costs,
+      farm_minutes: c.minutes, sensitivity: c.sensitivity, peers: c.peers,
       model: {
-        curve_usd: parts.curve,
-        category: parts.category,
-        category_n: parts.categoryN,
-        category_source: parts.categorySource,
-        momentum: parts.momentum,
-        seasoning: parts.seasoning,
-        sibling: parts.sibling,
+        curve_usd: c.curveR, category: c.catR, category_n: c.catN,
+        category_source: c.catSrc, momentum: c.momR, seasoning: c.seaR, sibling: c.sib,
       },
     };
   });
 
-  // Traded anchors: every comparable, by implied multiple, for the Anchors tab.
-  const anchors: AnchorRow[] = tokens
+  const anchors: Anchor[] = [...allComps]
+    .sort((a, b) => (b.mcap / b.tvl) - (a.mcap / a.tvl) || (a.slug < b.slug ? -1 : 1))
     .map((t) => ({
-      slug: t.slug,
-      name: t.name,
-      category: t.category,
-      tvl: t.tvl,
-      mcap: t.mcap,
-      multiple: round4(t.mcap / t.tvl),
-      change_7d: t.change_7d,
-      listed_at: t.listed_at,
-    }))
-    .sort((a, b) => b.multiple - a.multiple);
-
-  // Set aside: every pre-token protocol the rule leaves out, with its reason.
-  const setAside: SetAsideRow[] = snap.protocols
-    .filter((p) => isPreToken(p) && !isRankable(p))
-    .map((p) => ({ slug: p.slug, name: p.name, category: p.category, tvl: p.tvl_usd, reason: rankableReason(p) ?? '' }))
-    .sort((a, b) => b.tvl - a.tvl);
-
-  const farmNext: FarmNextCard[] = [...rows]
-    .sort((a, b) => b.per_hour_usd - a.per_hour_usd)
-    .slice(0, 5)
-    .map((r) => ({
-      slug: r.slug,
-      name: r.name,
-      rank: r.rank,
-      mechanism: r.mechanism,
-      net_usd: r.net_usd,
-      net_low_usd: r.net_low_usd,
-      gas_usd: r.gas_usd,
-      hours: r.hours,
-      per_hour_usd: r.per_hour_usd,
-      per_hour_low_usd: r.per_hour_low_usd,
-      odds: r.odds,
+      slug: t.slug, name: t.name, category: t.category, tvl: t.tvl, mcap: t.mcap,
+      multiple: round4(t.mcap / t.tvl), change_7d: t.ch, listed_at: t.listed,
     }));
 
-  const watchlistRows = rows.filter((r) => snap.watchlist.includes(r.slug));
-  const bestWatch = [...watchlistRows].sort((a, b) => b.per_hour_usd - a.per_hour_usd)[0];
-  // Verdicts are netted at the P25 low end; the point-value split is kept
-  // beside them so the reader can see what the low end costs.
-  const lowEnd = {
-    farm: rows.filter((r) => r.verdict === 'FARM').length,
-    thin: rows.filter((r) => r.verdict === 'THIN').length,
-    skip: rows.filter((r) => r.verdict === 'SKIP').length,
-  };
-  const pointVerdicts = {
-    farm: rows.filter((r) => r.net_usd > 0).length,
-    thin: rows.filter((r) => r.net_usd <= 0 && r.slice_usd > r.fees_usd).length,
-    skip: rows.filter((r) => r.net_usd <= 0 && r.slice_usd <= r.fees_usd).length,
-  };
+  const verdicts = { farm: 0, thin: 0, skip: 0 };
+  const pointVerdicts = { farm: 0, thin: 0, skip: 0 };
+  let totalImpliedUsd = 0;
+  for (const r of rows) {
+    totalImpliedUsd += r.implied_value_usd;
+    if (r.verdict === "FARM") verdicts.farm++;
+    else if (r.verdict === "THIN") verdicts.thin++;
+    else verdicts.skip++;
+    const pv = verdictFor(r.net_usd, r.slice_usd, r.fees_usd);
+    if (pv === "FARM") pointVerdicts.farm++;
+    else if (pv === "THIN") pointVerdicts.thin++;
+    else pointVerdicts.skip++;
+  }
+
+  const farmNext = [...rows]
+    .sort((a, b) => b.per_hour_usd - a.per_hour_usd || (a.slug < b.slug ? -1 : 1))
+    .slice(0, 5)
+    .map((r) => ({
+      slug: r.slug, name: r.name, rank: r.rank, mechanism: r.mechanism,
+      net_usd: r.net_usd, net_low_usd: r.net_low_usd, gas_usd: r.gas_usd,
+      hours: r.hours, per_hour_usd: r.per_hour_usd,
+      per_hour_low_usd: r.per_hour_low_usd, odds: r.odds,
+    }));
+
+  const wlRows = rows.filter((r) => snap.watchlist.includes(r.slug));
+  const bestWl = [...wlRows].sort((a, b) => b.per_hour_usd - a.per_hour_usd || (a.slug < b.slug ? -1 : 1))[0];
+  const bestPerHourWatchlist = bestWl
+    ? { name: bestWl.name, slug: bestWl.slug, perHour: bestWl.per_hour_usd }
+    : { name: "", slug: "", perHour: 0 };
+
+  const headline = `${rows.length} pre-token protocols priced from the ${kept.length} tokens already trading; ${verdicts.farm} still pay at the low end.`;
 
   const validation: Validation = {
-    firstA: round4(first.a),
-    firstB: round4(first.b),
-    firstSd: round4(firstSd),
-    fit,
-    outliers,
-    categories: factors,
-    loo,
-    split2024,
-    split2025,
-    ageSplit,
-    growthSlope,
-    ageSlope,
-    quantiles,
-    ridge,
-    walkForward: wf,
-    termSelection: terms,
-    onePerTicker,
-    bootstrapRefits: TUNE.bootstrapRefits,
-    tiltsMove,
-    marketChange7d: round4(marketChange),
+    firstA, firstB, firstSd,
+    fit: { a: fit.a, b: fit.b, n: fit.n, r2: fit.r2 },
+    outliers, categories, loo, split2024, split2025, ageSplit,
+    growthSlope, ageSlope, quantiles: qRound,
+    ridge: { lambda: 10, n: kept.length, medianMiss: ridge.medianMiss, within3: ridge.within3, curveOnlyMiss: loo.curveOnly.medianMiss },
+    walkForward, termSelection: terms, onePerTicker,
+    bootstrapRefits: 200, tiltsMove, marketChange7d,
   };
 
-  const totalImplied = rows.reduce((s, r) => s + r.implied_value_usd, 0);
   return {
-    asOf,
-    modelVersion: MODEL_VERSION,
-    watchlist: snap.watchlist,
+    asOf, modelVersion: MODEL_VERSION, watchlist: snap.watchlist,
     counts: {
-      protocols: snap.protocols.length,
-      preToken: snap.protocols.filter(isPreToken).length,
-      ranked: rows.length,
-      watchlist: snap.watchlist.length,
-      watchlistCovered: watchlistRows.length,
-      comps: tokens.length,
-      kept: kept.length,
-      outliers: outliers.length,
+      protocols: snap.protocols.length, preToken: preToken.length,
+      ranked: rows.length, watchlist: snap.watchlist.length,
+      watchlistCovered: wlRows.length, comps: allComps.length,
+      kept: kept.length, outliers: outliers.length,
       setAside: setAside.length,
-      traded: snap.protocols.length - snap.protocols.filter(isPreToken).length,
+      traded: snap.protocols.filter((p) => p.symbol).length,
     },
-    verdicts: lowEnd,
-    pointVerdicts,
-    fit,
-    outliers,
-    categories: factors,
-    validation,
-    rows,
-    anchors,
-    setAside,
-    farmNext,
-    bestPerHourWatchlist: bestWatch
-      ? { name: bestWatch.name, slug: bestWatch.slug, perHour: bestWatch.per_hour_usd }
-      : null,
-    totalImpliedUsd: totalImplied,
-    headline: `${rows.length} pre-token protocols priced off the ${kept.length} tokens that already trade; ${lowEnd.farm} pay even at the low end.`,
+    verdicts, pointVerdicts,
+    fit: { a: fit.a, b: fit.b, n: fit.n, r2: fit.r2 },
+    outliers, categories, validation,
+    rows, anchors, setAside, farmNext, bestPerHourWatchlist,
+    totalImpliedUsd, headline,
   };
 }

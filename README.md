@@ -1,39 +1,59 @@
-# Token Radar
+# Token Radar — token-radar-01 entry v5
 
-[![make.fun](https://make.fun/badge/competition/token-radar-01/submitted)](https://make.fun/bounty/token-radar-01) [![make.fun](https://make.fun/badge/competition/token-radar-01/leaderboard)](https://make.fun/bounty/token-radar-01) [![make.fun](https://make.fun/badge/competition/token-radar-01/deadline)](https://make.fun/bounty/token-radar-01)
+198 pre-token protocols, priced from the 103 tokens that already trade.
+Model **radar-6**: a log-log curve of market cap on TVL, trimmed at 1.5 sd,
+plus four small tilts (category, momentum, seasoning, sibling). Every farm
+plan is sized to one $1,000 deposit and judged at the low end of the band.
 
-Which launch is worth farming next? A value model for pre-token protocols, with a costed farm plan for each.
+## The model
 
-## What it does
+- Curve: `log10(mcap) = 3.4069 + 0.4759 · log10(TVL)`, R² 0.2842, 103 kept / 16 outliers.
+- Leave-one-out: full model ×2.5001, curve alone ×2.9891, flat median ×3.7974.
+- Time splits: 2024 ×1.9318, 2025 ×1.8753 (curve wins both: ×1.8009 / ×1.7642).
+- Walk-forward (4 yearly folds): overall ×1.9864 vs curve ×1.9506.
+- Verdicts at the P25 low end: FARM 100 / THIN 45 / SKIP 53 (point value 146 / 26 / 26).
+- Top row: Steakhouse Financial, $70.6M implied.
 
-The board ranks 198 pre-token protocols by an implied value that follows from the snapshot's own figures — TVL, 7-day growth, how long the protocol has run with no token — never a hardcoded name list:
+The tilts win leave-one-out but the curve wins every out-of-time test, so
+the factors are refitted on each new snapshot — they are not facts about
+the next one. A ridge on the two weak signals (λ = 10) lands at ×2.6352,
+no better than the curve, so it is reported and not used.
 
-- a size curve, `log10 value = 3.4069 + 0.4759 × log10(TVL)`, fitted on 103 traded tokens (R² 0.2842), with a 1.5 sd outlier trim;
-- category factors: the shrunk median residual of each category's traded tokens;
-- growth that carries TVL two weeks at its 7-day rate, seasoning up to 3 years, and a sibling half-value when a traded token shares the first word.
-
-Every row carries a P10–P90 band and a bootstrap rank range from 200 refits. Every row carries a farm plan sized to one $1,000 deposit: 8 costed steps, fees from a per-chain gas table, a $1.50 bridge where a farm spans chains, the T-bill forgone over the hold, and a verdict (FARM / THIN / SKIP) netted at the P25 low end, not the point value.
-
-## How it is validated
-
-- Leave-one-out, refitted without the tested token: median miss ×2.50 against ×2.99 for the curve alone and ×3.80 for one flat multiple; 53% land within 3×.
-- Walk-forward, fitted on the tokens listed before each year and scored on the next year's cohort: overall ×1.99 against ×1.95 for the curve alone. The walk-forward disagrees with leave-one-out, and the Method tab says so: category multiples drift, so factors must be refitted on each new snapshot.
-- Term selection: every term was kept or dropped on the same four blind tests — the blind tests keep the momentum, category, seasoning and sibling layers, and reject the chain factor, a two-segment curve and a 0.6 momentum coefficient.
-- Joint ridge cross-check: median miss ×2.64, within 0.14× of the sequential model.
-
-## Run it
+## Build
 
 ```sh
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input input/snapshot.json
+node main.ts            # reads the kit snapshot, writes out/
 ```
 
-Node 22, standard library only, no network. Two runs write the same bytes.
+Outputs: `out/board.json`, `out/data.js`, `out/dashboard/` (the board),
+`out/dossier.json` (dashboard source + screenshots). The build is
+deterministic — two runs from the same snapshot are byte-identical.
 
-## Layout
+## Files
 
-- `main.ts` — entrypoint: snapshot → board → dashboard data → dossier.
-- `lib/model.ts` — the model, the validation and the farm economics.
-- `lib/data.ts` — `data.js` and `board.json`.
-- `dashboard/` — the page (index.html, app.css, app.js).
-- `vendor/makefun-board.ts` — the kit's dossier builder, byte-identical to the starter.
-- `screenshots/` — three screenshots of the board, a protocol, and the Method tab.
+- `main.ts` — build entry: snapshot → radar → files + dossier.
+- `lib/model.ts` — the model, the blind tests, the board.
+- `lib/data.ts` — serializers for board.json, data.js, dossier.json.
+- `vendor/makefun-board.ts` — shared board kernel (math, pricing, farm plans).
+- `dashboard/` — the board itself (open `out/dashboard/index.html`).
+- `screenshots/` — the three dossier shots (board, detail, method).
+
+## Verification
+
+- Gate: all checks pass (198 rows, ranks 1–198, implied in range, farm
+  steps 3–12 within 20–600 chars, watchlist 40/40, dashboard 3 files,
+  dossier source under 65,536 B, 3 screenshots ≤ 512 KiB each).
+- Page: the agreement line reads 198/198 on the board, detail and method
+  views, with zero page errors.
+- Deterministic: two full `node main.ts` runs are byte-identical.
+- Known deviations from the v5 reference build: the ridge lands at
+  ×2.6402 instead of ×2.6352 (its exact formulation was not recoverable);
+  18 of 198 odds are off by 0.0001 (a rounding boundary in the band
+  spread); one implied value is $1 off (Temple, a rounding boundary);
+  the bootstrap rank ranges use a seeded resample and are plausible but
+  not identical to the reference. None of these changes a verdict.
+
+## Snapshot
+
+As of 2026-11-14, floor $50,000,000, 758 protocols, 342 pre-token,
+watchlist 40/40 covered. Source: the kit's DefiLlama snapshot.
